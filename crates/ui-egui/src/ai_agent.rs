@@ -24,6 +24,7 @@ use serde_json::{Map, Value, json};
 
 use crate::SheetApp;
 use crate::control::{self, ControlRequest, Outcome};
+use crate::icons::Icon;
 use crate::theme::{self, Tokens};
 
 /// Tab selector in the AI Agent pane. Switching tabs only changes the view — active connections
@@ -381,6 +382,12 @@ pub enum WorkerEvent {
         mode: AgentMode,
         reason: String,
     },
+    /// Windows speech recognition finished: the recognizer's language and its transcript (or a
+    /// friendly error message when no recognizer/speech was available).
+    VoiceResult {
+        language: String,
+        result: Result<String, String>,
+    },
     Finished,
 }
 
@@ -462,6 +469,11 @@ pub struct AiAgentState {
     /// English toast notification forwarded to `SheetApp::toast`.
     pub pending_toast: Option<String>,
 
+    /// Voice input: true while Windows speech recognition is listening to the microphone.
+    pub voice_listening: bool,
+    voice_rx: Option<Receiver<WorkerEvent>>,
+    voice_cancel: Arc<AtomicBool>,
+
     /// Dedicated in-process control channel so background AI threads can execute MCP tools on `SheetApp`
     /// even when `--control` TCP server is also active.
     pub control_tx: Option<Sender<ControlRequest>>,
@@ -534,6 +546,9 @@ impl Default for AiAgentState {
             worker_rx: None,
             error_notification: None,
             pending_toast: None,
+            voice_listening: false,
+            voice_rx: None,
+            voice_cancel: Arc::new(AtomicBool::new(false)),
             control_tx: Some(control_tx),
             control_rx: Some(control_rx),
             control_port: None,
@@ -705,6 +720,34 @@ impl AiAgentState {
         }
     }
 
+    /// Start voice input: Windows speech recognition listens to the default microphone for one
+    /// utterance. The transcript fills the chat input and is sent automatically when a backend is
+    /// connected. Indonesian is used when its Windows speech language is installed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_voice_input(&mut self, ctx: egui::Context) {
+        if self.voice_listening {
+            return;
+        }
+        self.error_notification = None;
+        self.voice_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&self.voice_cancel);
+        let (tx, rx) = channel();
+        self.voice_rx = Some(rx);
+        self.voice_listening = true;
+        let _ = std::thread::Builder::new().name("ai-voice".into()).spawn(move || {
+            let (language, result) = run_voice_recognition(&cancel);
+            let _ = tx.send(WorkerEvent::VoiceResult { language, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Stop listening to the microphone and discard the partial recognition.
+    pub fn stop_voice_input(&mut self) {
+        self.voice_cancel.store(true, Ordering::SeqCst);
+        self.voice_listening = false;
+        self.voice_rx = None;
+    }
+
     /// Loads the AI session of workbook document `doc`: a new file starts with an empty History;
     /// switching back to an earlier file restores that file's own conversation and input draft.
     /// Backend connections and API configuration stay global (configured once).
@@ -715,6 +758,10 @@ impl AiAgentState {
         if self.session_doc == Some(doc) {
             return;
         }
+        // A voice utterance belongs to the file it was started from: stop listening on a switch.
+        self.voice_cancel.store(true, Ordering::SeqCst);
+        self.voice_listening = false;
+        self.voice_rx = None;
         let was_running = self.running;
         if was_running {
             self.cancel_flag.store(true, Ordering::SeqCst);
@@ -743,10 +790,13 @@ impl AiAgentState {
     /// Stop active tasks and disconnect all backends when the AI Agent panel itself is closed.
     pub fn stop_and_disconnect(&mut self, reason: Option<String>) {
         self.cancel_flag.store(true, Ordering::SeqCst);
+        self.voice_cancel.store(true, Ordering::SeqCst);
         self.api_verify_cancel.store(true, Ordering::SeqCst);
         self.cli_verify_cancel.store(true, Ordering::SeqCst);
         self.ollama_verify_cancel.store(true, Ordering::SeqCst);
         self.running = false;
+        self.voice_listening = false;
+        self.voice_rx = None;
         self.cli_scanning_models = false;
         self.ollama_scanning = false;
         self.worker_rx = None;
@@ -765,7 +815,10 @@ impl AiAgentState {
     /// Poll background verification & chat worker events each frame.
     pub fn poll(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
-        for rx in [&self.api_verify_rx, &self.api_models_rx, &self.cli_verify_rx, &self.ollama_verify_rx, &self.worker_rx].into_iter().flatten() {
+        for rx in [&self.api_verify_rx, &self.api_models_rx, &self.cli_verify_rx, &self.ollama_verify_rx, &self.worker_rx, &self.voice_rx]
+            .into_iter()
+            .flatten()
+        {
             while let Ok(ev) = rx.try_recv() {
                 events.push(ev);
             }
@@ -919,6 +972,26 @@ impl AiAgentState {
                     let eng_reason = format_english_error(&reason);
                     self.notify_error(format!("{eng_reason} — active task stopped and closed."));
                     self.disconnect_mode(mode, Some(eng_reason));
+                }
+                WorkerEvent::VoiceResult { language, result } => {
+                    self.voice_listening = false;
+                    self.voice_rx = None;
+                    match result {
+                        Ok(transcript) if !transcript.trim().is_empty() => {
+                            let transcript = transcript.trim().to_string();
+                            self.messages.push(ChatEntry::System(format!("Voice ({language}): {transcript}")));
+                            self.chat_input = transcript.clone();
+                            self.error_notification = None;
+                            // Sending by voice: a connected backend runs the command right away; with
+                            // no backend the transcript waits in the input box to be reviewed.
+                            if self.any_connected() && !self.running {
+                                self.chat_input.clear();
+                                send_chat_prompt(self, transcript, ctx.clone());
+                            }
+                        }
+                        Ok(_) => self.notify_error("Voice input: no speech was recognized. Try again and speak clearly.".to_string()),
+                        Err(error) => self.notify_error(format!("Voice input: {error}")),
+                    }
                 }
                 WorkerEvent::Finished => {
                     self.running = false;
@@ -1458,9 +1531,11 @@ fn show_history(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens
     }
 
     let mut trigger_send = false;
+    // The microphone button sits between the input box and Send (desktop only).
+    let mic_width = if cfg!(not(target_arch = "wasm32")) { 34.0 } else { 0.0 };
     ui.horizontal(|ui| {
         let response = ui.add_sized(
-            vec2((ui.available_width() - 62.0).max(80.0), 46.0),
+            vec2((ui.available_width() - 62.0 - mic_width).max(80.0), 46.0),
             egui::TextEdit::multiline(&mut app.ai_agent.chat_input)
                 .hint_text("Ask the AI Agent to build data, formulas, tables, formats, charts... (Enter to send)"),
         );
@@ -1470,6 +1545,28 @@ fn show_history(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens
             && !app.ai_agent.running
         {
             trigger_send = true;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let listening = app.ai_agent.voice_listening;
+            let color = if listening { Color32::from_rgb(210, 50, 50) } else { t.text_dim };
+            let (rect, resp) = ui.allocate_exact_size(vec2(mic_width, 46.0), egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(rect, 4.0, t.menu_bg);
+            }
+            crate::icons::paint(ui.painter(), rect.shrink2(vec2(8.0, 10.0)), Icon::Mic, color);
+            let resp = resp.on_hover_text(if listening {
+                "Stop voice input"
+            } else {
+                "Voice input: speak in your installed Windows speech language (Indonesian when added)"
+            });
+            if resp.clicked() {
+                if listening {
+                    app.ai_agent.stop_voice_input();
+                } else {
+                    app.ai_agent.start_voice_input(ctx.clone());
+                }
+            }
         }
         ui.vertical(|ui| {
             let can_send = !app.ai_agent.running && !app.ai_agent.chat_input.trim().is_empty();
@@ -1481,6 +1578,18 @@ fn show_history(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens
             }
         });
     });
+
+    if app.ai_agent.voice_listening {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Listening... speak now, then pause (Windows speech recognition).").small().italics().color(t.text_dim),
+                )
+                .wrap(),
+            );
+        });
+    }
 
     if trigger_send {
         let prompt = app.ai_agent.chat_input.trim().to_string();
@@ -6635,6 +6744,107 @@ fn run_process_cancellable_with_stdin(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const VOICE_SCRIPT: &str = r#"param([string]$Preferred = "id-ID")
+$ErrorActionPreference = "Stop"
+try {
+    Add-Type -AssemblyName System.Speech
+    $recognizers = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
+    if ($recognizers.Count -eq 0) {
+        Write-Output "ERR=NO_RECOGNIZER"
+        exit 3
+    }
+    $chosen = $null
+    foreach ($r in $recognizers) {
+        if ($r.Culture.Name -eq $Preferred) { $chosen = $r; break }
+    }
+    if (-not $chosen) {
+        foreach ($r in $recognizers) {
+            if ($r.Culture.Name -like "id-*") { $chosen = $r; break }
+        }
+    }
+    if (-not $chosen) { $chosen = $recognizers[0] }
+    $engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine($chosen.Culture)
+    $engine.InitialSilenceTimeout = [TimeSpan]::FromSeconds(10)
+    $engine.BabbleTimeout = [TimeSpan]::FromSeconds(3)
+    $engine.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.2)
+    $engine.EndSilenceTimeoutAmbiguous = [TimeSpan]::FromSeconds(1.5)
+    $engine.SetInputToDefaultAudioDevice()
+    $dictation = New-Object System.Speech.Recognition.DictationGrammar
+    $engine.LoadGrammar($dictation)
+    Write-Output ("LANG=" + $chosen.Culture.Name)
+    $result = $engine.Recognize([TimeSpan]::FromSeconds(25))
+    if ($null -eq $result) {
+        Write-Output "ERR=NO_SPEECH"
+        exit 4
+    }
+    Write-Output ("TEXT=" + $result.Text)
+    exit 0
+} catch {
+    Write-Output ("ERR=" + $_.Exception.Message)
+    exit 5
+}"#;
+
+/// Runs one Windows speech-recognition utterance on the default microphone (background thread).
+/// Returns the recognizer language (e.g. `id-ID`) and the transcript or a friendly error.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_voice_recognition(cancel: &AtomicBool) -> (String, Result<String, String>) {
+    let script_path = std::env::temp_dir().join("gridcraft-voice.ps1");
+    if std::fs::write(&script_path, VOICE_SCRIPT).is_err() {
+        return ("unknown".into(), Err("Could not write the Windows speech helper script.".into()));
+    }
+    let script = script_path.to_string_lossy().to_string();
+    let args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script.as_str()];
+    let result = run_process_cancellable_with_stdin("powershell", &args, None, None, cancel, true, 90);
+    let _ = std::fs::remove_file(&script_path);
+    match result {
+        Ok(output) => parse_voice_output(&output),
+        Err(error) => ("unknown".into(), Err(voice_error_hint(&error))),
+    }
+}
+
+/// Parse the helper script's stdout (`LANG=`, `TEXT=`, `ERR=` lines) into a transcript.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_voice_output(output: &str) -> (String, Result<String, String>) {
+    let mut language = String::from("unknown");
+    let mut text: Option<String> = None;
+    let mut error: Option<String> = None;
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("LANG=") {
+            language = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("TEXT=") {
+            let transcript = rest.trim();
+            if !transcript.is_empty() {
+                text = Some(transcript.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("ERR=") {
+            error = Some(rest.trim().to_string());
+        }
+    }
+    if let Some(error) = error {
+        return (language, Err(voice_error_hint(&error)));
+    }
+    match text {
+        Some(transcript) => (language, Ok(transcript)),
+        None => (language, Err("No speech was recognized. Try again and speak clearly.".into())),
+    }
+}
+
+/// User-facing guidance for the two common Windows speech failures.
+#[cfg(not(target_arch = "wasm32"))]
+fn voice_error_hint(message: &str) -> String {
+    let low = message.to_ascii_lowercase();
+    if low.contains("no_recognizer") || low.contains("no recognizer") {
+        return "Windows speech recognition is not installed for any language. Add a speech language in Windows \
+                Settings > Time & Language > Speech (for Indonesian, add Indonesian with speech), then try again."
+            .into();
+    }
+    if low.contains("no microphone") || low.contains("no audio") || low.contains("audio device") {
+        return "No microphone was found. Connect a microphone and allow Windows to use it, then try again.".into();
+    }
+    format!("Windows speech recognition failed: {message}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6752,5 +6962,21 @@ mod tests {
         state.retain_document_sessions(&[2]);
         state.use_document_session(1);
         assert!(state.messages.is_empty(), "the closed file's session was forgotten");
+    }
+    #[test]
+    fn voice_script_output_parses_language_and_transcript() {
+        let (language, result) = parse_voice_output("LANG=id-ID\nTEXT=buat laporan penjualan");
+        assert_eq!(language, "id-ID");
+        assert!(matches!(result, Ok(text) if text == "buat laporan penjualan"));
+
+        let (_, no_recognizer) = parse_voice_output("LANG=en-US\nERR=NO_RECOGNIZER");
+        let message = match no_recognizer {
+            Err(message) => message,
+            Ok(_) => String::new(),
+        };
+        assert!(message.contains("speech language"), "unexpected hint: {message}");
+
+        let (_, no_speech) = parse_voice_output("LANG=en-US\nERR=NO_SPEECH");
+        assert!(no_speech.is_err());
     }
 }

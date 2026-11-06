@@ -135,6 +135,8 @@ pub enum Icon {
     OpenFolder,
     Info,
     Print,
+    /// Microphone: the AI Agent's voice-input button.
+    Mic,
 }
 
 struct G<'a> {
@@ -637,6 +639,13 @@ fn paint_with(p: &Painter, rect: Rect, icon: Icon, c: Color32, pal: &Palette) {
             g.rect(2.0, 2.0, 12.0, 12.0, None, Some(c));
             g.line(&[(4.5, 6.0), (7.0, 8.0), (4.5, 10.0)], green, 1.3);
             g.stroke(&[(8.0, 10.5), (11.5, 10.5)], c);
+        }
+        Icon::Mic => {
+            // A microphone: capsule, cradle arc, stem and base.
+            g.rect(6.0, 2.0, 4.0, 8.0, Some(c), None);
+            g.line(&[(4.0, 7.5), (4.0, 9.0), (5.0, 10.5), (6.5, 11.5), (8.0, 12.0), (9.5, 11.5), (11.0, 10.5), (12.0, 9.0), (12.0, 7.5)], c, 1.2);
+            g.line(&[(8.0, 12.0), (8.0, 15.0)], c, 1.2);
+            g.line(&[(6.0, 15.0), (10.0, 15.0)], c, 1.2);
         }
         Icon::Pen => {
             g.poly(&[(3.0, 13.0), (4.0, 10.0), (11.0, 3.0), (13.0, 5.0), (6.0, 12.0)], blue);

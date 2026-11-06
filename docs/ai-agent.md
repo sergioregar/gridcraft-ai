@@ -62,6 +62,27 @@ Backend configuration — provider, API key, CLI agent/model, Ollama URL and con
 global and is configured once, not per file. Only the conversation/context is per file; if you need
 per-file backends as well, that would be a separate change.
 
+## Voice input
+
+A microphone button sits between the chat input and **Send**. Press it and speak one utterance; the
+button shows a **Listening...** indicator while Windows speech recognition listens, then pauses when
+you stop talking. The transcript is written into the chat input and, when a backend is connected, the
+command is sent automatically (the History shows `Voice (<language>): <transcript>`). Press the
+microphone again to cancel while it is listening.
+
+Recognition uses the **Windows Speech Recognition** engine (`System.Speech`), so it works offline and
+with the speech languages installed in Windows. It prefers **Indonesian** (`id-ID`) when that speech
+language is installed, then falls back to the first installed recognizer. To add Indonesian:
+
+1. Windows Settings → **Time & Language → Language & region**.
+2. Add **Indonesian**, then under its **Language features** install **Speech** (the speech
+   recognition pack). A restart of the AI pane is not needed; the next microphone press uses it.
+3. The microphone tooltip and the History's `Voice (...)` line show which language was used.
+
+Without any installed speech language the pane shows a one-line error explaining how to add one.
+Voice input is available in the desktop app only (not the web build), and it never sends audio to
+GridCraft servers — recognition is local to Windows.
+
 ## Creating data from an empty sheet
 
 The engine and the agent both support starting from scratch. A validated recipe the prompt teaches:
