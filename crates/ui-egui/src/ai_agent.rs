@@ -1090,7 +1090,7 @@ fn format_english_error(raw: &str) -> String {
         return "An unexpected error occurred during processing.".to_string();
     }
     let lower = clean.to_ascii_lowercase();
-    if lower.contains("tidak ada koneksi internet") || lower.contains("koneksi internet terputus") {
+    if lower.contains("no internet connection") {
         return "No internet connection detected. Please check your network and try again.".to_string();
     }
     if lower.contains("waktu tunggu habis") || lower.contains("timed out") || lower.contains("print timeout") {
@@ -1099,10 +1099,10 @@ fn format_english_error(raw: &str) -> String {
     if lower.contains("individual quota reached") || lower.contains("resource_exhausted") || lower.contains("insufficient_quota") {
         return "Model quota or rate limit reached for this account. Please select another model.".to_string();
     }
-    if lower.contains("tidak ada tabel atau data") {
+    if lower.contains("no table or data") {
         return "No table or data found on the active sheet to process.".to_string();
     }
-    if lower.contains("tidak memiliki kolom angka") {
+    if lower.contains("has no numeric column") {
         return "The active table has no numeric columns available for chart visualization.".to_string();
     }
     clean
@@ -2977,10 +2977,7 @@ fn is_summary_row_on_sheet(sh: &gridcraft_engine::model::Sheet, row: u32, c0: u3
             && let gridcraft_engine::core::Value::Text(s) = &cell.value
         {
             let low = s.trim().to_ascii_lowercase();
-            if matches!(low.as_str(), "total" | "jumlah" | "subtotal" | "grand total" | "rata-rata" | "rata rata" | "average")
-                || low.starts_with("total ")
-                || low.starts_with("jumlah ")
-            {
+            if matches!(low.as_str(), "total" | "subtotal" | "grand total" | "average") || low.starts_with("total ") || low.starts_with("total ") {
                 return true;
             }
         }
@@ -3287,7 +3284,7 @@ fn apply_table_blueprint_on_app(app: &mut SheetApp, merge_requested: bool) -> bo
         }
     }
 
-    // Remove any middle `Total` / `Jumlah` summary row that got trapped between `data_start_row` and `end_row`
+    // Remove any middle `Total` summary row that got trapped between `data_start_row` and `end_row`
     // when new rows were appended below the original `Totals` row!
     if let Some(sh_mut) = wb.sheet_mut(active_idx) {
         let mut r = bp.data_start_row;
@@ -3944,22 +3941,13 @@ fn detect_sheet_tables(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::
         let header_row = has_header.then_some(r.start.row);
         let data_start_row = if has_header { r.start.row + 1 } else { r.start.row };
 
-        // Check if bottom row is a Total / Jumlah / Rata-rata summary row
+        // Check if the bottom row is a Total / Average summary row
         let mut is_bottom_summary = formal_totals;
         if !is_bottom_summary && r.end.row > data_start_row {
             for col in r.start.col..=r.end.col {
                 if let Value::String(s) = cell_raw(r.end.row, col) {
                     let low = s.trim().to_ascii_lowercase();
-                    if low == "total"
-                        || low == "jumlah"
-                        || low == "subtotal"
-                        || low == "grand total"
-                        || low == "rata-rata"
-                        || low == "rata rata"
-                        || low == "average"
-                        || low.starts_with("total ")
-                        || low.starts_with("jumlah ")
-                    {
+                    if low == "total" || low == "subtotal" || low == "grand total" || low == "average" || low.starts_with("total ") {
                         is_bottom_summary = true;
                         break;
                     }
@@ -4040,13 +4028,13 @@ fn detect_sheet_tables(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::
             } else if !rc.texts.is_empty() && rc.nums.is_empty() {
                 ColKind::Category
             } else if !rc.nums.is_empty()
-                && (matches!(h_low.as_str(), "no" | "no." | "id" | "#" | "nomor" | "urut" | "index" | "kode")
+                && (matches!(h_low.as_str(), "no" | "no." | "id" | "#" | "number" | "index" | "code")
                     || (is_sequential_int && any_text_col && num_col_count >= 2))
             {
                 ColKind::Id
             } else if !rc.nums.is_empty()
                 && num_col_count >= 2
-                && (h_low == "total" || h_low == "jumlah" || h_low == "subtotal" || h_low == "grand total" || h_low.starts_with("total "))
+                && (h_low == "total" || h_low == "subtotal" || h_low == "grand total" || h_low.starts_with("total "))
             {
                 ColKind::Total
             } else if !rc.nums.is_empty()
@@ -4242,7 +4230,7 @@ fn build_comparison_visual_plan(table: &DetectedTable) -> Vec<ComparisonSpec> {
             title: format!("Tren {} per {}", join_headers(&detail_cols), cat.header),
         });
     } else if all_metrics.len() >= 2 {
-        // Multiple numeric metrics with different scales (e.g. Harga, Terjual, Total) -> plot each metric in its own distinct visual!
+        // Multiple numeric metrics with different scales (e.g. Price, Units Sold, Total) -> plot each metric in its own visual!
         let m0 = all_metrics[0];
         let m1 = all_metrics.get(1).copied().unwrap_or(m0);
         let m2 = all_metrics.get(2).copied().or_else(|| total_cols.first().copied()).unwrap_or(m1);
@@ -4280,7 +4268,7 @@ fn build_comparison_visual_plan(table: &DetectedTable) -> Vec<ComparisonSpec> {
             title: format!("Tren {} per {}", m0.header, cat.header),
         });
     } else {
-        // Single numeric column (e.g. Nama | Kategori | Nilai) -> 3 distinct chart types bound cleanly to that numeric column!
+        // Single numeric column (e.g. Name | Category | Value) -> 3 distinct chart types bound cleanly to it!
         let m = all_metrics[0];
         specs.push(ComparisonSpec {
             chart_type: "column".into(),
@@ -4503,43 +4491,23 @@ fn prompt_wants_merge_tables(prompt: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 fn prompt_wants_delete_all(prompt: &str) -> bool {
     let low = prompt.trim().to_ascii_lowercase();
-    if matches!(
-        low.as_str(),
-        "hapus"
-            | "hapus semua"
-            | "hapus semuanya"
-            | "hapus data"
-            | "hapus semua data"
-            | "bersihkan"
-            | "bersihkan semua"
-            | "clear"
-            | "clear all"
-            | "delete"
-            | "delete all"
-            | "reset"
-            | "kosongkan"
-    ) {
+    if matches!(low.as_str(), "delete" | "delete all" | "remove all" | "delete data" | "delete all data" | "clear" | "clear all" | "reset" | "wipe") {
         return true;
     }
-    let has_del = low.contains("hapus")
-        || low.contains("bersihkan")
-        || low.contains("kosongkan")
-        || low.contains("clear")
-        || low.contains("delete")
-        || low.contains("reset");
-    let mentions_all = low.contains("semua")
-        || low.contains("seluruh")
-        || low.contains("all")
+    let has_del = low.contains("clear") || low.contains("delete") || low.contains("remove") || low.contains("wipe") || low.contains("reset");
+    let mentions_all = low.contains("all")
+        || low.contains("entire")
+        || low.contains("whole")
+        || low.contains("everything")
         || low.contains("sheet")
-        || (low.contains("data")
-            && (low.contains("chart") || low.contains("visual") || low.contains("grafik") || low.contains("table") || low.contains("tabel")));
+        || (low.contains("data") && (low.contains("chart") || low.contains("visual") || low.contains("graph") || low.contains("table")));
     has_del && mentions_all
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn prompt_wants_delete_charts(prompt: &str) -> bool {
     let low = prompt.trim().to_ascii_lowercase();
-    let has_del = low.contains("hapus") || low.contains("hilangkan") || low.contains("clear") || low.contains("delete") || low.contains("remove");
+    let has_del = low.contains("clear") || low.contains("delete") || low.contains("remove");
     let has_chart = low.contains("chart") || low.contains("visual") || low.contains("grafik") || low.contains("diagram");
     has_del && has_chart && !prompt_wants_delete_all(prompt)
 }
@@ -4593,7 +4561,7 @@ fn humanize_tool_start(name: &str, args: &Value) -> String {
         }
         "clear_range" => "Clearing data, fills and chart widgets…".into(),
         "delete_chart" => "Deleting chart widgets…".into(),
-        "evaluate_formula" => "Menghitung rumus…".into(),
+        "evaluate_formula" => "Evaluating the formula…".into(),
         "list_commands" => {
             let search = args.get("search").and_then(Value::as_str).unwrap_or("");
             if search.is_empty() { "Mencari command GridCraft…".into() } else { format!("Mencari command \"{search}\"…") }
@@ -4740,11 +4708,11 @@ fn humanize_tool_done(name: &str, args: &Value, result: &Value) -> String {
     }
 }
 
-/// Detect if the user prompt explicitly asked to create N charts/visuals (e.g. "buatkan 3 visual perbandingan").
+/// Detect if the user prompt explicitly asked to create N charts/visuals (e.g. "make 3 comparison charts").
 #[cfg(not(target_arch = "wasm32"))]
 fn requested_chart_count(prompt: &str) -> Option<usize> {
     let low = prompt.to_ascii_lowercase();
-    let has_create = low.contains("buat")
+    let has_create = low.contains("make")
         || low.contains("bikin")
         || low.contains("tampilkan")
         || low.contains("create")
@@ -4785,7 +4753,7 @@ fn requested_chart_count(prompt: &str) -> Option<usize> {
 /// Smart Chart Integrator & Multi-Visual Engine:
 /// - Synchronizes merged/expanded table formatting with Table 1 first so the chart range covers all merged rows.
 /// - Automatically binds charts to the active table's real category column and real numeric columns
-///   (skipping ID columns, non-numeric text columns like `Kategori`, empty sparkline columns, and bottom `Total` summary rows).
+///   (skipping ID columns, non-numeric text columns like `Category`, empty sparkline columns, and bottom `Total` summary rows).
 /// - Guarantees that when multiple comparison visuals are created in a turn, each visual has a distinct chart type,
 ///   meaningful comparative data series, visible `dataLabels`, and non-overlapping dashboard coordinates!
 #[cfg(not(target_arch = "wasm32"))]
@@ -4800,7 +4768,7 @@ fn smart_insert_chart(
     // Synchronize merged/expanded table formatting with Table 1 BEFORE reading the table for charting!
     let _ = call_control(control_tx, ctx, "ai.sync_table_format", json!({"merge_requested": prompt_wants_merge_tables(&turn_ctx.user_prompt)}));
 
-    // 1. Clear leftover charts on the sheet before inserting the first chart of a fresh "buatkan ... visual" request
+    // 1. Clear leftover charts before the first chart of a "make ... charts" request
     if !turn_ctx.cleared_existing_charts && !prompt_wants_append_chart(&turn_ctx.user_prompt) {
         turn_ctx.cleared_existing_charts = true;
         if let Some(snap) = detect_sheet_tables(control_tx, ctx) {
@@ -4980,7 +4948,7 @@ fn smart_insert_chart(
     }
     let multi_range_str = range_parts.join(",");
 
-    let cat_header = table.columns.iter().find(|c| c.col == chosen_cat_col).map(|c| c.header.as_str()).unwrap_or("Kategori");
+    let cat_header = table.columns.iter().find(|c| c.col == chosen_cat_col).map(|c| c.header.as_str()).unwrap_or("Category");
 
     let resolved_title = final_title.unwrap_or_else(|| {
         let prefix = match req_type.as_str() {
@@ -5073,10 +5041,10 @@ fn smart_insert_chart(
 }
 
 /// Post-turn consistency engine:
-/// 1. If the user asked to delete/clear all (`"hapus"`, `"hapus semua"`, `"clear"`, `"reset"`),
+/// 1. If the user asked to delete/clear all (`"delete"`, `"delete all"`, `"clear"`, `"reset"`),
 ///    executes `"ai.deep_clear"` so 100% of data, cell background colors, formal tables, sparklines,
 ///    conditional formats, and chart widgets are removed!
-/// 2. If the user asked to delete charts (`"hapus chart"` / `"hapus visual"`), removes all chart widgets.
+/// 2. If the user asked to delete charts (`"delete chart"` / `"delete visual"`), removes all chart widgets.
 /// 3. Otherwise:
 ///    - Synchronizes merged/expanded table formatting with Table 1's blueprint (`"ai.sync_table_format"`).
 ///    - Cleans up any orphaned chart widgets or empty formal tables (`"ai.cleanup_orphaned_charts"`).
@@ -6010,7 +5978,7 @@ fn run_api_agent_loop(
     let last_user_prompt = history.iter().rev().find(|(role, _)| role == "user").map(|(_, content)| content.clone()).unwrap_or_default();
     let mut turn_ctx = TurnContext::new(&last_user_prompt, full_tool_access, allow_ui_tools);
 
-    // Deterministic fast-path for explicit "hapus semua" / "clear all" requests so all data,
+    // Deterministic fast-path for explicit "delete all" / "clear all" requests so all data,
     // background colors, formal tables, auto-filters, selection boxes, and chart widgets are wiped immediately!
     // Full tool access deliberately skips it: the model decides which clear command (and target) the
     // request needs, instead of a keyword heuristic wiping the whole sheet.
@@ -6443,7 +6411,7 @@ fn build_terminal_prompt(
     ));
     prompt.push_str(
         "Examples (valid JSON inside the tags):\n\
-- Write table data: <gridcraft_tool>{\"name\":\"write_range\",\"arguments\":{\"range\":\"A1\",\"values\":[[\"Produk\",\"Q1\",\"Q2\"],[\"Laptop\",120,150]]}}</gridcraft_tool>\n",
+- Write table data: <gridcraft_tool>{\"name\":\"write_range\",\"arguments\":{\"range\":\"A1\",\"values\":[[\"Product\",\"Q1\",\"Q2\"],[\"Laptop\",120,150]]}}</gridcraft_tool>\n",
     );
     prompt.push_str(
         "- Run ANY GridCraft feature (sort, filter, freeze, pivot, chart, conditional formatting, page setup, print, validation, protection, comment, file save/export, ...): <gridcraft_tool>{\"name\":\"execute_command\",\"arguments\":{\"command\":\"data.sortDescending\",\"params\":{\"range\":\"A1:C10\",\"column\":\"B\"}}}</gridcraft_tool>\n",
@@ -6480,7 +6448,7 @@ fn run_cli_agent_turn(
 ) {
     let mut turn_ctx = TurnContext::new(user_prompt, full_tool_access, allow_ui_tools);
 
-    // Deterministic fast-path for explicit "hapus semua" / "clear all" requests. Full tool access
+    // Deterministic fast-path for explicit "delete all" / "clear all" requests. Full tool access
     // skips it so the model decides which clear command (and target) the request needs.
     if !full_tool_access && prompt_wants_delete_all(&turn_ctx.user_prompt) && requested_chart_count(&turn_ctx.user_prompt).is_none() {
         let _ =
@@ -7277,9 +7245,9 @@ mod tests {
     }
     #[test]
     fn voice_script_output_parses_language_and_transcript() {
-        let (language, result) = parse_voice_output("LANG=id\nTEXT=buat laporan penjualan");
-        assert_eq!(language, "id");
-        assert!(matches!(result, Ok(text) if text == "buat laporan penjualan"));
+        let (language, result) = parse_voice_output("LANG=en\nTEXT=make a sales report");
+        assert_eq!(language, "en");
+        assert!(matches!(result, Ok(text) if text == "make a sales report"));
 
         let (_, missing_engine) = parse_voice_output("ERR=Speech engine not installed. Run `pip install faster-whisper`");
         let message = match missing_engine {
@@ -7305,8 +7273,8 @@ mod tests {
     #[test]
     fn voice_transcript_appends_to_the_input_without_sending() {
         // Voice only fills the textbox: this helper never sends anything.
-        assert_eq!(merge_voice_transcript("", "  buat laporan  "), "buat laporan");
-        assert_eq!(merge_voice_transcript("buat", "laporan penjualan"), "buat laporan penjualan");
-        assert_eq!(merge_voice_transcript("draft  ", "tambahkan total"), "draft tambahkan total");
+        assert_eq!(merge_voice_transcript("", "  make a report  "), "make a report");
+        assert_eq!(merge_voice_transcript("make", "a sales report"), "make a sales report");
+        assert_eq!(merge_voice_transcript("draft  ", "add a total"), "draft add a total");
     }
 }

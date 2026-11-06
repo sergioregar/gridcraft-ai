@@ -263,11 +263,11 @@ pub(crate) fn column_letters(mut col: u32) -> String {
 }
 
 /// Whether a label reads like a totals/summary row ("TOTAL", "Subtotal", "Gross profit", "Net",
-/// "Jumlah", "Laba", "Rugi", ...). Also covers statement subtotals such as "OPERATING INCOME",
+/// "Net", "Gross", ...). Also covers statement subtotals such as "OPERATING INCOME",
 /// "INCOME BEFORE TAX", "INCOME TAX" and "NET INCOME", which close a section like a total row.
 pub(crate) fn report_is_total_label(label: &str) -> bool {
     let low = label.trim().to_ascii_lowercase();
-    let words = ["total", "subtotal", "sub total", "grand total", "gross", "net", "jumlah", "laba", "rugi", "balance"];
+    let words = ["total", "subtotal", "sub total", "grand total", "gross", "net", "balance"];
     let starts = words.iter().any(|word| {
         low == *word || low.starts_with(&format!("{word} ")) || low.starts_with(&format!("{word}:")) || low.starts_with(&format!("{word} -"))
     });
@@ -282,9 +282,6 @@ pub(crate) fn report_is_total_label(label: &str) -> bool {
         "earnings before",
         "ebit",
         "ebitda",
-        "laba kotor",
-        "laba bersih",
-        "laba usaha",
     ];
     starts || statement_totals.iter().any(|needle| low.contains(needle))
 }
@@ -322,7 +319,7 @@ pub(crate) enum ReportColumnKind {
     Label,
     /// Short text (category, department, notes).
     Text,
-    /// Money/nominal (price, revenue, cost, total...).
+    /// Money amounts (price, revenue, cost, total...).
     Money,
     /// Quantities/targets/units.
     Quantity,
@@ -385,22 +382,22 @@ pub(crate) fn classify_report_column(header: &str, values: &[Value]) -> ReportCo
     if has(&["%", "percent", "persen", "variance", "varians", "growth", "pertumbuhan", "margin", "rate", "yoy"]) {
         return ReportColumnKind::Percent;
     }
-    if has(&["id", "kode", "code", "no.", "nomor", "date", "tanggal", "status", "sku"]) {
+    if has(&["id", "code", "no.", "number", "date", "status", "sku"]) {
         return ReportColumnKind::Code;
     }
-    if has(&["qty", "quantity", "unit", "units", "target", "terjual", "sold", "count", "stok", "stock", "pcs"]) {
+    if has(&["qty", "quantity", "unit", "units", "target", "sold", "count", "stock", "pcs"]) {
         return ReportColumnKind::Quantity;
     }
     if has(&[
         "price",
-        "harga",
+        "price",
         "amount",
-        "nominal",
+        "amount",
         "total",
         "revenue",
         "pendapatan",
         "sales",
-        "penjualan",
+        "sales",
         "cost",
         "cogs",
         "hpp",
@@ -408,8 +405,8 @@ pub(crate) fn classify_report_column(header: &str, values: &[Value]) -> ReportCo
         "beban",
         "biaya",
         "income",
-        "laba",
-        "rugi",
+        "profit",
+        "loss",
         "profit",
         "gaji",
         "salary",
@@ -431,10 +428,10 @@ pub(crate) fn classify_report_column(header: &str, values: &[Value]) -> ReportCo
     ]) {
         return ReportColumnKind::Money;
     }
-    if has(&["category", "kategori", "department", "departemen", "tipe", "type", "group", "grup", "kelas", "class"]) {
+    if has(&["category", "department", "type", "group", "class", "segment"]) {
         return ReportColumnKind::Text;
     }
-    if has(&["description", "deskripsi", "account", "akun", "product", "produk", "item", "nama", "name", "uraian", "keterangan", "label"]) {
+    if has(&["description", "account", "product", "item", "name", "detail", "label", "title"]) {
         return ReportColumnKind::Label;
     }
     if values.iter().any(report_cell_is_numeric) {
@@ -611,7 +608,7 @@ Decide the intent of every message first:
    offer to do it; do not write a tutorial.
 4. OUT-OF-TOPIC question (news, general knowledge, coding help, chit-chat) -> decline in one short
    line (\"I only work on this workbook.\") and do nothing. Never answer it.
-5. EMPTY WORKBOOK + a request to make/buatkan a report, list or data -> CREATE the data yourself:
+5. EMPTY WORKBOOK + a request to make a report, list or data -> CREATE the data yourself:
    write a title row, a header row, at least 10 plausible rows (unique product names or categories,
    quantities, unit prices, dates), formulas (quantity*price, a totals row), number formats, AutoFit the
    columns for readability, a clean table style, and a chart when asked. This is allowed: \"never invent data\" means never misreport
@@ -1051,7 +1048,7 @@ pub(crate) fn openai_tools(full_access: bool, allow_ui: bool) -> Value {
             "type": "function",
             "function": {
                 "name": "create_report",
-                "description": "Build and lay out a clean neutral table/report from scratch in one FINAL LAYOUT PASS: merged left title/subtitle (no border) with one blank 10pt spacer before the header, formatted-width columns (no ###, no clipped labels), bold header with top thin + bottom medium rules, section headings, indented line items, subtotal rules, a grand total with a double bottom rule, number formats without forced colours, frozen header and print fit-to-one-page. Use this for any 'make a report/statement/list' request instead of writing cells one by one. Rows are arrays whose first cell is the label; label-only rows are section headings and rows labelled TOTAL/Subtotal/Gross/Net/Operating income/Income before tax/Income tax/Laba/Rugi are totals (the bottom-most is the grand total).",
+                "description": "Build and lay out a clean neutral table/report from scratch in one FINAL LAYOUT PASS: merged left title/subtitle (no border) with one blank 10pt spacer before the header, formatted-width columns (no ###, no clipped labels), bold header with top thin + bottom medium rules, section headings, indented line items, subtotal rules, a grand total with a double bottom rule, number formats without forced colours, frozen header and print fit-to-one-page. Use this for any 'make a report/statement/list' request instead of writing cells one by one. Rows are arrays whose first cell is the label; label-only rows are section headings and rows labelled TOTAL/Subtotal/Gross/Net/Operating income/Income before tax/Income tax/Profit/Loss are totals (the bottom-most is the grand total).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1496,11 +1493,11 @@ mod tests {
     #[test]
     fn report_columns_classify_for_alignment_and_formats() {
         assert_eq!(classify_report_column("Product", &[]), ReportColumnKind::Label);
-        assert_eq!(classify_report_column("Kategori", &[]), ReportColumnKind::Text);
+        assert_eq!(classify_report_column("Category", &[]), ReportColumnKind::Text);
         assert_eq!(classify_report_column("Qty", &[]), ReportColumnKind::Quantity);
-        assert_eq!(classify_report_column("Harga", &[]), ReportColumnKind::Money);
+        assert_eq!(classify_report_column("Price", &[]), ReportColumnKind::Money);
         assert_eq!(classify_report_column("Margin (%)", &[]), ReportColumnKind::Percent);
-        assert_eq!(classify_report_column("Kode", &[]), ReportColumnKind::Code);
+        assert_eq!(classify_report_column("Code", &[]), ReportColumnKind::Code);
         // A numeric column without a telling header still formats/aligns as money.
         assert_eq!(classify_report_column("FY 2026", &[json!(450000000)]), ReportColumnKind::Money);
         // Header and data alignment must form one straight vertical line.
@@ -1525,7 +1522,7 @@ mod tests {
         // Width = formatted content/header + safe padding, never below the kind's floor.
         assert!(report_column_width("Total", &[json!(450000000)], ReportColumnKind::Money) >= 18);
         assert!(report_column_width("Product", &[json!("Gaming Laptop")], ReportColumnKind::Label) >= 38);
-        assert!(report_column_width("Kategori", &[json!("Electronics")], ReportColumnKind::Text) >= 18);
+        assert!(report_column_width("Category", &[json!("Electronics")], ReportColumnKind::Text) >= 18);
         assert!(
             report_column_width("Long header name", &[json!(1)], ReportColumnKind::Quantity) >= "Long header name".len() as u32 + 6,
             "the header length must be included"
@@ -1545,7 +1542,7 @@ mod tests {
         assert!(report_is_total_label("TOTAL ASSETS"));
         assert!(report_is_total_label("Subtotal"));
         assert!(report_is_total_label("Net income"));
-        assert!(report_is_total_label("Jumlah"));
+        assert!(report_is_total_label("Grand total"));
         assert!(report_is_total_label("OPERATING INCOME"));
         assert!(report_is_total_label("INCOME BEFORE TAX"));
         assert!(report_is_total_label("INCOME TAX"));
