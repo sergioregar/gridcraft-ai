@@ -2514,27 +2514,15 @@ fn send_chat_prompt(state: &mut AiAgentState, prompt: String, ctx: egui::Context
 // In-Process MCP Tool Definitions, Live Grid/Table Context & Smart Chart Engine
 // ============================================================================
 
-const SYSTEM_PROMPT: &str = "You are the built-in AI Agent inside GridCraft, a modern spreadsheet application. \
-You have direct access to MCP spreadsheet tools to inspect, read, write, format, sort, filter, evaluate formulas, \
-clear cells/tables/charts, and create tables/charts on the live workbook.\n\
-Always use the spreadsheet tools directly to fulfill the user's request on the active sheet.\n\
-CRITICAL RULES FOR DATA, MERGING, DELETION, CHARTS & OUTPUT STYLE:\n\
-1. A complete LIVE GRID & TABLE CONTEXT is provided below showing every sheet, every table (formal and grid cell tables), \
-exact column letters (A, B, C...), row numbers (1, 2, 3...), column roles (CATEGORY vs NUMERIC), and actual cell values.\n\
-2. When merging two tables (e.g. 'gabungkan kedua tabel'), combine all data rows into the first table starting at its top-left cell, \
-keep only one unified Totals row at the very bottom, and clear any leftover rows from the second table.\n\
-3. When asked to delete/clear ('hapus', 'hapus semua', 'bersihkan', 'clear', 'reset'), call `clear_range` (with `{\"all\":true}` or target range) \
-so data, background colors, tables, and chart widgets are completely removed.\n\
-4. When asked to create multiple comparison visuals/charts (e.g. 3 visual perbandingan), you MUST call `insert_chart` once for EACH visual \
-using DIFFERENT chart types (`column`, `pie` or `doughnut`, `bar` or `line`), DIFFERENT column ranges (use comma-separated multi-area ranges \
-like `\"B4:B10,G4:G10\"` to bind the category column to specific numeric column(s), excluding any bottom Total row), \
-and DIFFERENT `at` anchor positions so the charts never look identical and never overlap!\n\
-5. RESPONSE FORMAT: Keep your text reply VERY SHORT, CONCISE, and TIDY (1 to 3 short sentences or bullet lines using `•`). \
-NEVER use asterisk characters (`*` or `**`) anywhere in your reply!\n\
-6. If native function calling is unavailable, emit tool calls in text using:\n\
-<gridcraft_tool>{\"name\":\"write_range\",\"arguments\":{\"range\":\"A1\",\"values\":[[\"Produk\",\"Kategori\",\"Q1\",\"Q2\",\"Total\"],[\"Laptop\",\"Elektronik\",120,150,\"=C2+D2\"]]}}</gridcraft_tool>\n\
-<gridcraft_tool>{\"name\":\"insert_chart\",\"arguments\":{\"range\":\"A1:A5,C1:C5,D1:D5\",\"type\":\"column\",\"title\":\"Perbandingan Q1 vs Q2\",\"at\":\"G2\"}}</gridcraft_tool>\n\
-<gridcraft_tool>{\"name\":\"clear_range\",\"arguments\":{\"all\":true}}</gridcraft_tool>";
+const SYSTEM_PROMPT: &str = "You are the built-in AI Agent inside GridCraft, a Rust-native spreadsheet. \
+Work on the open workbook with the provided tools. Follow the ROLE AND GROUND RULES above: work orders \
+are executed, questions about the workbook are answered from tool results, GridCraft or spreadsheet \
+questions get a 1-3 line answer plus an offer to do it, and out-of-topic questions are declined. \
+When the sheet is empty and the user asks for a report, list or data, build it yourself with write_range, \
+formulas, number formats, a table and (when asked) a chart. Keep replies short plain text: no asterisks, \
+no markdown tables, at most 3 lines. Always English. Never fabricate command ids, values or results.\
+If native function calling is unavailable, emit tool calls as: \
+<gridcraft_tool>{\"name\":\"write_range\",\"arguments\":{\"range\":\"A1\",\"values\":[[\"Product\",\"Qty\",\"Price\",\"Total\"],[\"Item A\",10,150000,\"=B2*C2\"]]}}</gridcraft_tool>";
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
@@ -5257,11 +5245,13 @@ fn run_api_agent_loop(
     let access_section = if full_tool_access {
         let catalog_text = if include_command_catalog {
             let catalog = fetch_command_catalog(&control_tx, ctx);
-            crate::ai_tools::catalog_prompt(&catalog, if is_local { 14000 } else { 20000 })
+            // Light prompts: local models get only the compact catalog (the ground rules carry the
+            // task protocol); cloud/terminal agents get the concise guide + recipes + catalog.
+            crate::ai_tools::catalog_prompt(&catalog, if is_local { 5000 } else { 12000 })
         } else {
             String::new()
         };
-        format!("{}\n\n{}\n\n{catalog_text}", crate::ai_tools::FEATURE_GUIDE, crate::ai_tools::CHEAT_SHEET)
+        if is_local { catalog_text } else { format!("{}\n\n{}\n\n{catalog_text}", crate::ai_tools::FEATURE_GUIDE, crate::ai_tools::CHEAT_SHEET) }
     } else {
         String::new()
     };
@@ -5637,7 +5627,7 @@ fn build_terminal_prompt(
         prompt.push_str("\n\n");
         if include_command_catalog {
             let catalog = fetch_command_catalog(control_tx, ctx);
-            prompt.push_str(&crate::ai_tools::catalog_prompt(&catalog, 16000));
+            prompt.push_str(&crate::ai_tools::catalog_prompt(&catalog, 12000));
             prompt.push('\n');
         }
     }

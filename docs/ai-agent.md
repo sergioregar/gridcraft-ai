@@ -16,23 +16,45 @@ chat/MCP panel and no access-control card to configure.
 
 ## Role and ground rules
 
-Every backend gets the same **ground rules** at the top of its prompt:
+Every backend gets the same compact **ground rules** at the top of its prompt; the agent decides the
+intent of each message first:
 
-- The agent is the **GridCraft Workbook Operator**, not a chatbot. Every user message is a work
-  order for the live workbook: it performs the spreadsheet operation with tools and reports what it
-  did — it does not answer general questions, explain concepts or dump knowledge.
-- Messages phrased as workbook questions ("how many rows?", "which product is best?") are treated
-  as inspection tasks: read/compute them with the tools (and put the result in cells when useful),
-  never answer from memory.
-- The agent reads before writing, prefers one focused call or a small `execute_commands` batch,
-  verifies structural changes, and asks at most one short clarifying question when the request
-  cannot be determined.
-- Visible replies are always in **English**, whatever language the user writes in, and are kept to
-  a few short lines.
+- **Work order** (create, edit, format, sort, filter, delete, chart, pivot, export…) → perform it with
+  tools on the live workbook and report what it did in a few short lines.
+- **Question about the workbook** ("how many rows?", "best seller?", "total?") → inspect or compute it
+  with tools and answer briefly from the tool results (writing the result into cells when useful).
+- **Question about GridCraft or spreadsheets** ("how do I freeze panes?") → a 1–3 line answer plus an
+  offer to do it; no tutorials.
+- **Out-of-topic question** (news, general knowledge, coding help, chit-chat) → declined in one line
+  ("I only work on this workbook.") and nothing is run.
+- **Empty workbook + a request to make a report/list/data** → the agent creates the data itself: a
+  title, a header row, at least ten plausible rows (unique products/categories, quantities, unit
+  prices, dates), formulas, a totals row, number formats, a table style and a chart when asked.
+  "Never invent data" only forbids misreporting existing data, not generating what the user asked for.
 
-Local Ollama models additionally receive a note that the context and command catalog in the prompt
-are complete for the active sheet, and to take one step at a time — the weaker models need that
-explicit framing.
+The agent reads before writing, prefers one focused call or a small `execute_commands` batch, verifies
+structural changes, and asks at most one short clarifying question when the intent cannot be
+determined. Visible replies are always in **English**, whatever language the user writes in.
+
+The prompt is deliberately light: the ground rules and the system prompt are compact, the command
+catalog is capped (12,000 characters for cloud/terminal agents, 5,000 for local Ollama), and local
+models get the catalog plus a short "take one step at a time" note instead of the full guide and
+recipe sheet. This keeps small local models focused on the task instead of drowning in prompt text.
+
+## Creating data from an empty sheet
+
+The engine and the agent both support starting from scratch. A validated recipe the prompt teaches:
+
+1. `write_range` at `A1` with a title row, a header row and 10+ products, e.g. `[["Sales Report"],
+   ["Product","Category","Qty","Price","Total"], ["Gaming Laptop","Electronics",12,18500000,"=C3*D3"], …,
+   ["TOTAL","","","","=SUM(E3:E12)"]]`.
+2. `home.bold`/`home.fillColor`/`home.fontColor` on the title and header, `home.numberFormat`
+   (`#,##0.00`) on the money columns, `home.borders` on the block, `insert.table` for a table style.
+3. `insert.chart` (`{"range":"B3:E12","type":"column","title":"Sales by Product","at":"G2"}`) when a
+   chart is wanted, then `file.saveAs` / `file.exportPdf`.
+
+The same sequence is reproducible without the AI: `gridcraft-cli run --script` with `range.setValues`,
+`home.*`, `insert.table` and `insert.chart` builds the identical report.
 
 ## Choosing a model (LLM API tab)
 
