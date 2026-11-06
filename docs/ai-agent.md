@@ -57,27 +57,38 @@ The engine and the agent both support starting from scratch. A validated recipe 
 The same sequence is reproducible without the AI: `gridcraft-cli run --script` with `range.setValues`,
 `home.*`, `insert.table` and `insert.chart` builds the identical report.
 
-## Report layout tools
+## Report layout tools (final layout pass)
 
 Hand-placing cells one by one is where models produce cramped columns, `###` and clipped labels, so
-the agent has two layout-first tools:
+the agent has two layout-first tools. Both run as the **final pass**, after every value and formula is
+written, and both are **neutral**: no fills, font colours, table styles or theme are forced.
 
-- **`create_report`** builds a clean table/report in one call: merged title (and optional subtitle),
-  a bold header row, readable column widths (label column ~38 characters, numeric columns ~16, or
-  explicit `column_widths`), number formats on the numeric columns, right-aligned numbers, wrapped
-  labels, section rows in bold with a tint, bold totals with a top + double bottom border, an
-  optional chart, a frozen header and a print area with fit-to-page. Rows are arrays with the label
-  in the first column; section/total rows are auto-detected (`TOTAL`, `Subtotal`, `Gross`, `Net`,
-  `Jumlah`, `Laba`, `Rugi`, …) or passed explicitly as `section_rows`/`total_rows`.
-- **`layout_sheet`** repairs an existing range without rewriting its values: AutoFit widths (or fixed
-  label/number widths), a bold header row, number formats on detected numeric columns, bold bordered
-  totals, a frozen header and print setup. It accepts explicit `header_row`, `label_column`,
-  `number_columns`, `total_rows` and `title_range`, and reads the sheet when they are omitted.
+- **`create_report`** builds the structure in one call and then lays it out: merged left-aligned title
+  (bold 15pt) and subtitle (italic 11pt) with no border, exactly one blank 10pt spacer row before the
+  header row; a bold header row with top thin + bottom medium borders; section headings bold left at
+  indent 0; line items regular left at indent 1; section subtotals bold with top + bottom thin
+  borders; the bottom-most total bold with top thin + bottom **double** border; one blank 10pt
+  spacer row between a closed section and the next section heading; number formats on the numeric
+  columns; sizes/widths from the formatted display length plus padding; frozen header; print fit to
+  one page wide.
+- **`layout_sheet`** applies the same final pass to an existing range **without changing any value or
+  formula**: it merges/styles the title block, inserts the missing 10pt spacer rows below a subtitle
+  and between sections (`home.insertRows`, which shifts formula references correctly), sets row
+  heights, alignment/indent, number formats, functional borders, frozen header and print setup.
+
+Widths use the formatted display length, not the raw value: grouped thousands, signs/parentheses and
+`%` are counted, and `+6` characters of padding are added so values never touch the next column.
+Floors are 36–42 characters for label/description columns, 16–20 for numbers, 12–14 for
+quantities/percentages. Whole money/quantities are formatted with `#,##0_);(#,##0);"-"` (never `.00`),
+percentages with `+0.0%;-0.0%;0.0%`, and both are right aligned with the header so the header and its
+column form one straight vertical line. Rows are vertically centred throughout; short headers are
+never wrapped (the column is widened instead). There are no vertical borders and no per-cell grid
+box: the only borders are the header rule, the subtotal rules and the grand-total double rule.
 
 A prompt like "buatkan laporan penjualan 10 produk" should call `create_report` with the headers and
 rows (or generate the data first) instead of writing cells individually; an income statement with
 section headings is just rows where only the first cell has text. If a sheet already looks cramped,
-`layout_sheet` fixes widths, formats and borders in place.
+`layout_sheet` fixes widths, heights, alignment and borders in place.
 
 
 ## Choosing a model (LLM API tab)

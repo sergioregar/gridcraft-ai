@@ -243,6 +243,12 @@ pub(crate) fn known_unimplemented(wanted: &str) -> Option<&'static str> {
     UNIMPLEMENTED_COMMANDS.iter().find(|(id, _)| id.eq_ignore_ascii_case(trimmed)).map(|(_, name)| *name)
 }
 
+// ============================================================================
+// Report layout geometry (pure, unit-tested): column widths from FORMATTED display
+// lengths, column kinds for alignment/number formats, row roles and spacer points.
+// No colours or theme are chosen here: the layout is deliberately neutral.
+// ============================================================================
+
 /// A1 letters for a 0-based column index (A, B, ..., Z, AA, ...).
 pub(crate) fn column_letters(mut col: u32) -> String {
     let mut out = String::new();
@@ -257,17 +263,34 @@ pub(crate) fn column_letters(mut col: u32) -> String {
 }
 
 /// Whether a label reads like a totals/summary row ("TOTAL", "Subtotal", "Gross profit", "Net",
-/// "Jumlah", "Laba", "Rugi", ...). Used to style totals in generated reports.
+/// "Jumlah", "Laba", "Rugi", ...). Also covers statement subtotals such as "OPERATING INCOME",
+/// "INCOME BEFORE TAX", "INCOME TAX" and "NET INCOME", which close a section like a total row.
 pub(crate) fn report_is_total_label(label: &str) -> bool {
     let low = label.trim().to_ascii_lowercase();
     let words = ["total", "subtotal", "sub total", "grand total", "gross", "net", "jumlah", "laba", "rugi", "balance"];
-    words.iter().any(|word| {
+    let starts = words.iter().any(|word| {
         low == *word || low.starts_with(&format!("{word} ")) || low.starts_with(&format!("{word}:")) || low.starts_with(&format!("{word} -"))
-    })
+    });
+    let statement_totals = [
+        "operating income",
+        "operating profit",
+        "operating loss",
+        "income before tax",
+        "income tax",
+        "profit before tax",
+        "profit after tax",
+        "earnings before",
+        "ebit",
+        "ebitda",
+        "laba kotor",
+        "laba bersih",
+        "laba usaha",
+    ];
+    starts || statement_totals.iter().any(|needle| low.contains(needle))
 }
 
-/// A label-only row (first cell has text, every other cell empty): an income-statement section
-/// heading like "REVENUE" / "COST OF GOODS SOLD".
+/// A label-only row (first cell has text, every other cell empty): a section heading such as
+/// "REVENUE" / "COST OF GOODS SOLD".
 pub(crate) fn report_is_section_row(row: &[Value]) -> bool {
     let Some(first) = row.first() else { return false };
     let has_label = first.as_str().is_some_and(|text| !text.trim().is_empty());
@@ -286,32 +309,286 @@ pub(crate) fn report_cell_is_numeric(cell: &Value) -> bool {
     match cell.as_str() {
         Some(text) => {
             let trimmed = text.trim();
-            trimmed.starts_with('=') || trimmed.trim_start_matches(['$', '€', '£', '¥']).replace([',', ' '], "").parse::<f64>().is_ok()
+            trimmed.starts_with('=') || trimmed.trim_start_matches(['$', '€', '£', '¥']).replace([',', ' ', '(', ')'], "").parse::<f64>().is_ok()
         }
         None => false,
     }
 }
 
-/// 0-based column indices (skipping the label column) that hold numbers or formulas in `rows`.
-pub(crate) fn report_numeric_columns(rows: &[Vec<Value>], first_data_col: usize) -> Vec<usize> {
-    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
-    (first_data_col..ncols).filter(|col| rows.iter().any(|row| row.get(*col).is_some_and(report_cell_is_numeric))).collect()
+/// What a column holds: drives header/data alignment, number format and minimum width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReportColumnKind {
+    /// Long labels (description, account, product, item name).
+    Label,
+    /// Short text (category, department, notes).
+    Text,
+    /// Money/nominal (price, revenue, cost, total...).
+    Money,
+    /// Quantities/targets/units.
+    Quantity,
+    /// Percentages, variances, growth.
+    Percent,
+    /// Codes, dates, short statuses: centred.
+    Code,
 }
 
-/// Column widths (A1 letters, characters) for a report: the label column is wider than the
-/// numeric ones, and `overrides` ("A" -> 40) win over the defaults.
-pub(crate) fn report_column_widths(ncols: usize, label_chars: u32, number_chars: u32, overrides: &Map<String, Value>) -> Vec<(String, u32)> {
-    (0..ncols as u32)
-        .map(|col| {
-            let letters = column_letters(col);
-            let chars = overrides.get(&letters).and_then(Value::as_u64).map(|value| value.clamp(6, 120) as u32).unwrap_or(if col == 0 {
-                label_chars.max(12)
+impl ReportColumnKind {
+    pub(crate) fn header_align(self) -> &'static str {
+        match self {
+            ReportColumnKind::Label | ReportColumnKind::Text => "Left",
+            ReportColumnKind::Money | ReportColumnKind::Quantity | ReportColumnKind::Percent => "Right",
+            ReportColumnKind::Code => "Center",
+        }
+    }
+
+    pub(crate) fn data_align(self) -> &'static str {
+        self.header_align()
+    }
+
+    /// Minimum width in characters (before content/padding) per the layout standard.
+    pub(crate) fn floor_width(self) -> u32 {
+        match self {
+            ReportColumnKind::Label => 38,
+            ReportColumnKind::Text => 18,
+            ReportColumnKind::Money => 18,
+            ReportColumnKind::Quantity => 14,
+            ReportColumnKind::Percent => 14,
+            ReportColumnKind::Code => 16,
+        }
+    }
+
+    /// Number format for the data cells. Money is accounting (no forced currency symbol) and only
+    /// shows decimals when the column really has fractional cents; integer values never show `.00`.
+    pub(crate) fn number_format(self, has_cents: bool) -> &'static str {
+        match self {
+            ReportColumnKind::Money | ReportColumnKind::Quantity => {
+                if has_cents {
+                    "#,##0.00_);(#,##0.00);\"-\""
+                } else {
+                    "#,##0_);(#,##0);\"-\""
+                }
+            }
+            ReportColumnKind::Percent => "+0.0%;-0.0%;0.0%",
+            ReportColumnKind::Label | ReportColumnKind::Text | ReportColumnKind::Code => "General",
+        }
+    }
+}
+
+fn header_words(header: &str) -> String {
+    header.to_ascii_lowercase()
+}
+
+/// Classify a column from its header, falling back to the data values.
+pub(crate) fn classify_report_column(header: &str, values: &[Value]) -> ReportColumnKind {
+    let low = header_words(header);
+    let has = |needles: &[&str]| needles.iter().any(|needle| low.contains(needle));
+    if has(&["%", "percent", "persen", "variance", "varians", "growth", "pertumbuhan", "margin", "rate", "yoy"]) {
+        return ReportColumnKind::Percent;
+    }
+    if has(&["id", "kode", "code", "no.", "nomor", "date", "tanggal", "status", "sku"]) {
+        return ReportColumnKind::Code;
+    }
+    if has(&["qty", "quantity", "unit", "units", "target", "terjual", "sold", "count", "stok", "stock", "pcs"]) {
+        return ReportColumnKind::Quantity;
+    }
+    if has(&[
+        "price",
+        "harga",
+        "amount",
+        "nominal",
+        "total",
+        "revenue",
+        "pendapatan",
+        "sales",
+        "penjualan",
+        "cost",
+        "cogs",
+        "hpp",
+        "expense",
+        "beban",
+        "biaya",
+        "income",
+        "laba",
+        "rugi",
+        "profit",
+        "gaji",
+        "salary",
+        "bonus",
+        "balance",
+        "saldo",
+        "debit",
+        "credit",
+        "kredit",
+        "asset",
+        "aset",
+        "liability",
+        "subtotal",
+        "gross",
+        "net",
+        "rp",
+        "usd",
+        "$",
+    ]) {
+        return ReportColumnKind::Money;
+    }
+    if has(&["category", "kategori", "department", "departemen", "tipe", "type", "group", "grup", "kelas", "class"]) {
+        return ReportColumnKind::Text;
+    }
+    if has(&["description", "deskripsi", "account", "akun", "product", "produk", "item", "nama", "name", "uraian", "keterangan", "label"]) {
+        return ReportColumnKind::Label;
+    }
+    if values.iter().any(report_cell_is_numeric) {
+        return ReportColumnKind::Money;
+    }
+    ReportColumnKind::Text
+}
+
+/// Number of decimal cents that actually occur in a money column (0 unless a value is fractional).
+pub(crate) fn report_money_has_cents(values: &[Value]) -> bool {
+    values.iter().any(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().replace([',', ' '], "").parse::<f64>().ok()))
+            .is_some_and(|number| (number.fract().abs() * 100.0).round() >= 1.0)
+    })
+}
+
+fn group_integer(digits: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = digits.chars().collect();
+    for (index, ch) in chars.iter().enumerate() {
+        if index > 0 && (chars.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*ch);
+    }
+    out
+}
+
+fn format_fixed(number: f64, decimals: usize, sign: bool) -> String {
+    let negative = number.is_sign_negative() && number.abs() >= 0.5 / 10_f64.powi(decimals as i32);
+    let abs = number.abs();
+    let factor = 10_f64.powi(decimals as i32);
+    let scaled = (abs * factor).round().max(0.0) as u128;
+    let integer = scaled / (factor as u128);
+    let fraction = scaled % (factor as u128);
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    } else if sign {
+        out.push('+');
+    }
+    out.push_str(&group_integer(&integer.to_string()));
+    if decimals > 0 {
+        out.push('.');
+        out.push_str(&format!("{fraction:0width$}", width = decimals));
+    }
+    out
+}
+
+/// Display length of a cell after its number format is applied (this is what must fit the column,
+/// not the raw value). `LayoutColumnKind` decides grouping/percent handling.
+pub(crate) fn report_formatted_length(value: &Value, kind: ReportColumnKind, has_cents: bool) -> usize {
+    let number = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return 0;
+            }
+            if matches!(kind, ReportColumnKind::Label | ReportColumnKind::Text | ReportColumnKind::Code) {
+                return trimmed.chars().count();
+            }
+            trimmed.trim_start_matches(['$', '€', '£', '¥', '(', '-']).replace([',', ' ', ')'], "").parse::<f64>().ok()
+        }
+        _ => None,
+    };
+    let Some(number) = number else {
+        return if matches!(kind, ReportColumnKind::Label | ReportColumnKind::Text | ReportColumnKind::Code) {
+            value.as_str().map(|text| text.chars().count()).unwrap_or(0)
+        } else {
+            0
+        };
+    };
+    match kind {
+        ReportColumnKind::Money | ReportColumnKind::Quantity => {
+            let decimals = if matches!(kind, ReportColumnKind::Money) && has_cents { 2 } else { 0 };
+            let text = format_fixed(number, decimals, false);
+            // Accounting format adds a trailing padding space for the `_)` token.
+            text.chars().count() + 1
+        }
+        ReportColumnKind::Percent => format_fixed(number * 100.0, 1, true).chars().count() + 1,
+        ReportColumnKind::Label | ReportColumnKind::Text | ReportColumnKind::Code => {
+            let text = if number.fract() == 0.0 { format_fixed(number, 0, false) } else { format_fixed(number, 2, false) };
+            text.chars().count()
+        }
+    }
+}
+
+/// Width in characters for one column: max(formatted content, header) + safe padding (+6), with the
+/// kind's minimum floor. This guarantees no `###` and a visible whitespace gap before the next column.
+pub(crate) fn report_column_width(header: &str, values: &[Value], kind: ReportColumnKind) -> u32 {
+    let has_cents = matches!(kind, ReportColumnKind::Money) && report_money_has_cents(values);
+    let content = values.iter().map(|value| report_formatted_length(value, kind, has_cents)).max().unwrap_or(0);
+    let header_len = header.chars().count();
+    let width = content.max(header_len) as u32 + 6;
+    width.max(kind.floor_width()).min(120)
+}
+
+/// Row role inside a structured/financial report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReportRowRole {
+    /// "REVENUE", "COST OF GOODS SOLD": bold, left, no values.
+    Section,
+    /// A line item under a section: regular, left, indented when inside a section.
+    LineItem,
+    /// "TOTAL REVENUE", "GROSS PROFIT": bold, top+bottom thin borders.
+    Subtotal,
+    /// The bottom-most total ("NET INCOME"): bold, top thin + bottom double.
+    GrandTotal,
+}
+
+/// Roles for the data rows: section headings are their own level; the bottom-most total becomes the
+/// grand total, earlier totals are section subtotals, everything else is a line item.
+pub(crate) fn report_row_roles(labels: &[Option<String>], sections: &[bool]) -> Vec<ReportRowRole> {
+    let total_flags: Vec<bool> = labels.iter().map(|label| label.as_deref().is_some_and(report_is_total_label)).collect();
+    let last_total = total_flags.iter().rposition(|flag| *flag);
+    labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            if sections.get(index).copied().unwrap_or(false) {
+                return ReportRowRole::Section;
+            }
+            let Some(label) = label else { return ReportRowRole::LineItem };
+            if label.trim().is_empty() {
+                return ReportRowRole::LineItem;
+            }
+            if total_flags[index] {
+                if Some(index) == last_total { ReportRowRole::GrandTotal } else { ReportRowRole::Subtotal }
             } else {
-                number_chars.max(8)
-            });
-            (letters, chars)
+                ReportRowRole::LineItem
+            }
         })
         .collect()
+}
+
+/// A row is a section heading when the label is present but no value cells follow it.
+pub(crate) fn report_section_flags(rows: &[Vec<Value>]) -> Vec<bool> {
+    rows.iter().map(|row| report_is_section_row(row)).collect()
+}
+
+/// Marks input rows after which a 10pt blank spacer must be inserted: a total/subtotal row that is
+/// followed by a new section heading. Exactly one blank row per section boundary.
+pub(crate) fn report_spacer_after(roles: &[ReportRowRole], sections: &[bool]) -> Vec<bool> {
+    let mut spacers = vec![false; roles.len()];
+    for index in 0..roles.len().saturating_sub(1) {
+        let closes_section = matches!(roles[index], ReportRowRole::Subtotal | ReportRowRole::GrandTotal);
+        if closes_section && sections[index + 1] {
+            spacers[index] = true;
+        }
+    }
+    spacers
 }
 
 /// Highest-priority role definition for every backend (cloud API, Terminal CLI and local Ollama).
@@ -355,34 +632,46 @@ Discover with list_commands {\"search\":\"sort\"} (no search = whole catalog), d
 ids work: bold -> home.bold), batch with execute_commands {\"commands\":[...]}, list_functions for the
 514 worksheet functions. ui_control {\"method\":...,\"params\":...} reaches UI-only actions (ui.inspect,
 ui.ribbon, ui.dialog, app.language.*). Commands act on the ACTIVE sheet: pass range/sheet explicitly.
-For reports/tables prefer create_report (clean layout built in); use layout_sheet to fix a cramped or
-messy existing range. Never claim a feature is missing before list_commands finds no match.
+Always finish table/report work with the layout pass: create_report for a new report, layout_sheet to
+repair an existing range. Never claim a feature is missing before list_commands finds no match.
 ";
 
 /// Prompt-ready recipes, condensed to keep the prompt light. Every example is a command this build
 /// implements; params are documented by `describe_command`.
 pub(crate) const CHEAT_SHEET: &str = "\
-=== RECIPES (validated on this build) ===
-Report from scratch: write_range {\"range\":\"A1\",\"values\":[[\"Sales Report\"],[\"Product\",\"Category\",\"Qty\",\"Price\",\"Total\"], ...10+ rows..., [\"TOTAL\",\"\",\"\",\"\",\"=SUM(E3:E12)\"]]} with formulas like \"=C3*D3\";
-then home.bold {range:\"A1:E1\"}, home.fillColor, home.numberFormat {range:\"D3:E13\",format:\"#,##0.00\"},
-insert.table {range:\"A2:E13\"}, home.autofitColumnWidth {cols:\"A:E\"}, data.sortDescending {range:\"A2:E13\",column:\"E\"},
-insert.chart {range:\"B3:E12\",type:\"column\",title:\"Sales by product\",at:\"G2\"}.
-Formatting: home.formatCells {range,style:{font,fill,borders,align,numFmt}}; home.fontColor|home.fillColor
-{range,color:\"#RRGGBB\"}; home.numberFormat {format:\"#,##0.00\"|\"Currency\"|\"0%\"}; home.borders
-{range,preset:\"all\"}; home.mergeCenter; home.columnWidth {cols,width}; home.wrapText.
-Data: data.sortAscending|data.sortDescending {range,column}; data.sort {range,keys:[{column,order}]};
-data.filterBy {column,values}; data.removeDuplicates; data.validation {range,type:\"list\",formula1:\"A,B,C\"};
-data.textToColumns {range,delimiters}.
-Tables/pivot/charts: insert.table {range,style?,name?}; table.totalRow {table,on}; insert.pivotTable
-{source,rows,columns,values:[{field,func}],destination}; insert.pivotChart {pivot,type,at}; insert.chart
-{range,type:\"column|bar|line|pie|doughnut|area|scatter|combo|histogram|waterfall|funnel|treemap|sunburst|boxWhisker|stock\",subtype? (\"stacked100\"),title,at}; chart.set {chart,title,legend,dataLabels}; insert.sparkline.
-View/print: view.freezePanes {cell:\"B2\"}; view.zoom {percent}; pageLayout.orientation; pageLayout.headerFooter
-{header,footer,scaleWithDoc,alignWithMargins}; file.exportPdf {path}; file.saveAs {path}.
-More: data.outlineSettings {summaryBelow,summaryRight}; edit.fillSeries {type:\"date\",dateUnit:\"day|weekday|
-month|year\"}; formulas.errorChecking; pivot.options {enableShowDetails}; edit.goTo {reference};
-formulas.pasteName; review.workbookStatistics; app.checkForUpdates; ui.dialog {name:\"commandSearch|agents|
-journal\"}; view.theme; view.interfaceScale.
-Layout rules: for a new report prefer create_report {\"title\",\"subtitle?\",\"headers\",\"rows\",\"total_rows?\",\"number_format\",\"chart?\"}; to repair an existing messy range call layout_sheet {\"range\",\"header_row?\",\"number_columns?\",\"total_rows?\"}. Label column 34-42 chars, numeric columns 14-18, merged title row, bold header, numbers right-aligned with a format, totals bold with top+double border, freeze header, print area fit-to-page. Never leave ### or clipped text.
+=== RECIPES, LAYOUT RULES AND COMMANDS (validated) ===
+FINAL LAYOUT PASS: before finishing any table/report creation or edit, run create_report (new report)
+or layout_sheet (existing range). That pass comes AFTER all values and formulas are written; never
+leave the sheet half-formatted.
+ATURAN KERAPIAN MUTLAK: (1) never leave ###, clipped text or values touching the next column: width
+columns from the FORMATTED display length plus padding 6 (label 36-42, number 16-20, quantity and
+percent 12-14 characters). (2) merged title/subtitle are left or centre aligned (never right); title
+bold 14-16pt, subtitle italic 10-11pt, no box border, exactly ONE blank 10pt spacer row before the
+column header row. (3) header alignment matches its column and stays straight vertically: text left,
+number/currency/percent right, code/date/status centre; vertical alignment centre everywhere; never
+wrap short headers, widen the column instead. (4) sectioned reports: section headings bold left with
+indent 0; line items regular left with indent 1; subtotal rows bold left with top+bottom thin
+borders; the grand total bold left with top thin + bottom DOUBLE border; after a subtotal/grand
+total that is followed by a new section insert exactly one blank 10pt spacer row, and no other free
+spacer rows. (5) NO full grid box borders and no vertical borders: header row top thin + bottom
+medium; section rows no border; line items no border; subtotal top+bottom thin; grand total top thin
++ bottom double. (6) whole money/quantity values show no .00 (format #,##0_);(#,##0);\"-\"), percent
+uses one decimal (+0.0%;-0.0%;0.0%) and is right aligned; row heights: title 27, subtitle 19, spacer
+10, header 25, section 22, line item 19, subtotal 22, grand total 24pt; freeze below the header row;
+print fit to 1 page wide. Keep colours neutral: no fills, font colours or table styles.
+create_report {title?,subtitle?,headers:[...],rows:[[label,value,...]],chart?} builds
+all of it in one call; layout_sheet {range?,header_row?}
+repairs an existing range without changing values. Executors: write_range, read_range, execute_command
+and execute_commands (batch), list_commands, describe_command, list_functions, ui_control. Commands:
+cell.set/range.setValues; home.* formatting; data.* sort/filter/validation; insert.chart/table/
+pivotTable; view.freezePanes; pageLayout.printArea/pageSetup; file.saveAs/exportPdf.
+Compact ids: write_range/read_range; home.formatCells, home.bold, home.numberFormat, home.columnWidth, home.rowHeight,
+home.borders, home.mergeCells, home.alignLeft|Center|Right|Middle, home.increaseIndent, home.wrapText;
+data.sortAscending, data.sortDescending, data.filterBy, data.validation; insert.table, insert.chart, insert.pivotTable,
+insert.sparkline; view.freezePanes, view.zoom; pageLayout.printArea, pageLayout.pageSetup; file.saveAs, file.exportPdf.
+Newer features are reachable too: stacked100 chart subtype; pageLayout.headerFooter scaleWithDoc/alignWithMargins;
+data.outlineSettings; edit.fillSeries dateUnit; pivot.options enableShowDetails; formulas.errorChecking;
+app.checkForUpdates; ui.dialog commandSearch/agents/journal; view.theme; view.interfaceScale.
 ";
 
 /// Whitelisted control-channel methods for the `ui_control` tool. Everything else (quit, printing,
@@ -762,7 +1051,7 @@ pub(crate) fn openai_tools(full_access: bool, allow_ui: bool) -> Value {
             "type": "function",
             "function": {
                 "name": "create_report",
-                "description": "Build a clean, readable table/report from scratch in one call: merged title, bold header row, readable column widths (no ###, no truncated labels), number formats, aligned numbers, section rows, bold totals with borders, optional chart, frozen header and print setup. Use this for any 'make a report/statement/list' request instead of writing cells one by one. Rows are arrays; the first column is the label column. Section rows are label-only rows (auto-detected when omitted); total rows are detected from labels like TOTAL, SUBTOTAL, GROSS, NET.",
+                "description": "Build and lay out a clean neutral table/report from scratch in one FINAL LAYOUT PASS: merged left title/subtitle (no border) with one blank 10pt spacer before the header, formatted-width columns (no ###, no clipped labels), bold header with top thin + bottom medium rules, section headings, indented line items, subtotal rules, a grand total with a double bottom rule, number formats without forced colours, frozen header and print fit-to-one-page. Use this for any 'make a report/statement/list' request instead of writing cells one by one. Rows are arrays whose first cell is the label; label-only rows are section headings and rows labelled TOTAL/Subtotal/Gross/Net/Operating income/Income before tax/Income tax/Laba/Rugi are totals (the bottom-most is the grand total).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -774,14 +1063,7 @@ pub(crate) fn openai_tools(full_access: bool, allow_ui: bool) -> Value {
                             "description": "Data rows, first cell is the label",
                             "items": {"type": "array", "items": {"type": ["string", "number", "null"]}}
                         },
-                        "section_rows": {"type": "array", "items": {"type": "integer"}, "description": "0-based row indices to style as section headers (auto-detected when omitted)"},
-                        "total_rows": {"type": "array", "items": {"type": "integer"}, "description": "0-based row indices to style as totals (auto-detected from labels when omitted)"},
-                        "number_format": {"type": "string", "description": "Number format for numeric columns (default #,##0.00)"},
-                        "label_width": {"type": "integer", "description": "Label column width in characters (default 38)"},
-                        "number_width": {"type": "integer", "description": "Width of each numeric column in characters (default 16)"},
-                        "column_widths": {"type": "object", "description": "Optional per-column widths in characters, e.g. {\"A\": 40, \"B\": 18}"},
                         "chart": {"type": "object", "description": "Optional {\"type\":\"column|bar|line|pie\",\"title\":\"...\",\"at\":\"E2\"}"},
-                        "table_style": {"type": "boolean", "description": "Also apply a formatted table style (off by default for statements with sections)"},
                         "freeze_header": {"type": "boolean", "description": "Freeze the title/header rows (default true)"},
                         "print_setup": {"type": "boolean", "description": "Set print area, orientation and fit-to-page (default true)"}
                     },
@@ -793,20 +1075,12 @@ pub(crate) fn openai_tools(full_access: bool, allow_ui: bool) -> Value {
             "type": "function",
             "function": {
                 "name": "layout_sheet",
-                "description": "Fix the layout of an existing messy range/report without rewriting values: readable column widths (no ###), merged title (optional), bold header row, right-aligned numbers with a number format, bold borders on total rows, frozen header, print area and fit-to-page. Call this when a sheet looks cramped, text is truncated or numbers show ###.",
+                "description": "Apply the same neutral FINAL LAYOUT PASS to an existing range/report WITHOUT changing any value or formula: format-driven widths (no ###), title/subtitle merge and alignment, one blank 10pt spacer below the subtitle and between sections (inserted with row shifts, so formulas stay correct), row heights, header/data alignment straight down each column, indent hierarchy, number formats, functional horizontal borders (header rule, subtotal rules, grand total double rule; no grid box), frozen header and print fit-to-one-page. Call this when a sheet looks cramped, text is clipped or numbers show ###.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "range": {"type": "string", "description": "A1 range to lay out; defaults to the used range"},
-                        "header_row": {"type": "integer", "description": "1-based header row (auto-detected when omitted)"},
-                        "label_column": {"type": "string", "description": "Column with labels (default A)"},
-                        "number_columns": {"type": "array", "items": {"type": "string"}, "description": "Columns with numbers, e.g. [\"B\",\"C\"] (auto-detected when omitted)"},
-                        "total_rows": {"type": "array", "items": {"type": "integer"}, "description": "1-based rows to style as totals (auto-detected from labels when omitted)"},
-                        "title_range": {"type": "string", "description": "Optional range to merge and style as the title, e.g. \"A1:C1\""},
-                        "number_format": {"type": "string", "description": "Number format for numeric columns (default #,##0.00)"},
-                        "autofit_widths": {"type": "boolean", "description": "Compute widths from content (default true)"},
-                        "freeze_header": {"type": "boolean"},
-                        "print_setup": {"type": "boolean"}
+                        "header_row": {"type": "integer", "description": "1-based header row (auto-detected when omitted)"}
                     }
                 }
             }
@@ -1200,20 +1474,69 @@ mod tests {
     }
 
     #[test]
-    fn prompt_stays_light_and_teaches_the_report_recipe() {
+    fn layout_prompt_requires_the_final_pass_within_budget() {
         let total = GROUND_RULES.len() + FEATURE_GUIDE.len() + CHEAT_SHEET.len();
         assert!(total < 7000, "AI prompt grew heavy again: {total} chars");
-        assert!(CHEAT_SHEET.contains("Report from scratch"), "missing the from-scratch report recipe");
-        assert!(CHEAT_SHEET.contains("write_range"), "missing the data-creation tool");
-        assert!(CHEAT_SHEET.contains("TOTAL"), "the report recipe must build a totals row");
-        assert!(
-            FEATURE_GUIDE.contains("create_report") && CHEAT_SHEET.contains("create_report"),
-            "the report layout tools must be documented for the model"
-        );
+        for needle in [
+            "FINAL LAYOUT PASS",
+            "ATURAN KERAPIAN MUTLAK",
+            "create_report",
+            "layout_sheet",
+            "no fills",
+            "blank 10pt spacer",
+            "double",
+            "indent",
+            "no .00",
+        ] {
+            assert!(CHEAT_SHEET.contains(needle), "layout prompt missing `{needle}`");
+        }
+        assert!(FEATURE_GUIDE.contains("layout pass"), "feature guide must require the final layout pass");
     }
 
     #[test]
-    fn report_layout_helpers_classify_rows_and_columns() {
+    fn report_columns_classify_for_alignment_and_formats() {
+        assert_eq!(classify_report_column("Product", &[]), ReportColumnKind::Label);
+        assert_eq!(classify_report_column("Kategori", &[]), ReportColumnKind::Text);
+        assert_eq!(classify_report_column("Qty", &[]), ReportColumnKind::Quantity);
+        assert_eq!(classify_report_column("Harga", &[]), ReportColumnKind::Money);
+        assert_eq!(classify_report_column("Margin (%)", &[]), ReportColumnKind::Percent);
+        assert_eq!(classify_report_column("Kode", &[]), ReportColumnKind::Code);
+        // A numeric column without a telling header still formats/aligns as money.
+        assert_eq!(classify_report_column("FY 2026", &[json!(450000000)]), ReportColumnKind::Money);
+        // Header and data alignment must form one straight vertical line.
+        assert_eq!(ReportColumnKind::Label.header_align(), "Left");
+        assert_eq!(ReportColumnKind::Label.data_align(), "Left");
+        assert_eq!(ReportColumnKind::Money.header_align(), "Right");
+        assert_eq!(ReportColumnKind::Money.data_align(), "Right");
+        assert_eq!(ReportColumnKind::Percent.data_align(), "Right");
+        assert_eq!(ReportColumnKind::Code.header_align(), "Center");
+        assert_eq!(ReportColumnKind::Code.data_align(), "Center");
+    }
+
+    #[test]
+    fn formatted_widths_avoid_shebang_and_trailing_double_zero() {
+        // Whole money/quantities are grouped but never show `.00`.
+        assert_eq!(report_formatted_length(&json!(450000000), ReportColumnKind::Money, false), 12);
+        assert!(!ReportColumnKind::Money.number_format(false).contains(".00"));
+        assert!(!ReportColumnKind::Quantity.number_format(false).contains(".00"));
+        assert!(!report_money_has_cents(&[json!(450000000), json!(-4500)]));
+        assert!(report_money_has_cents(&[json!(12.5)]));
+
+        // Width = formatted content/header + safe padding, never below the kind's floor.
+        assert!(report_column_width("Total", &[json!(450000000)], ReportColumnKind::Money) >= 18);
+        assert!(report_column_width("Product", &[json!("Gaming Laptop")], ReportColumnKind::Label) >= 38);
+        assert!(report_column_width("Kategori", &[json!("Electronics")], ReportColumnKind::Text) >= 18);
+        assert!(
+            report_column_width("Long header name", &[json!(1)], ReportColumnKind::Quantity) >= "Long header name".len() as u32 + 6,
+            "the header length must be included"
+        );
+        // Percent uses one decimal + % and stays right aligned.
+        assert_eq!(report_formatted_length(&json!(0.253), ReportColumnKind::Percent, false), 6);
+        assert_eq!(ReportColumnKind::Percent.header_align(), "Right");
+    }
+
+    #[test]
+    fn row_roles_and_section_spacers_follow_the_layout_standard() {
         assert_eq!(column_letters(0), "A");
         assert_eq!(column_letters(25), "Z");
         assert_eq!(column_letters(26), "AA");
@@ -1223,24 +1546,30 @@ mod tests {
         assert!(report_is_total_label("Subtotal"));
         assert!(report_is_total_label("Net income"));
         assert!(report_is_total_label("Jumlah"));
+        assert!(report_is_total_label("OPERATING INCOME"));
+        assert!(report_is_total_label("INCOME BEFORE TAX"));
+        assert!(report_is_total_label("INCOME TAX"));
         assert!(!report_is_total_label("Revenue"));
-
         assert!(report_is_section_row(&[json!("REVENUE"), Value::Null, json!("")]));
         assert!(!report_is_section_row(&[json!("REVENUE"), json!(100)]));
         assert!(!report_is_section_row(&[json!("TOTAL"), Value::Null, Value::Null]));
 
-        let rows = vec![
-            vec![json!("Product"), json!("Qty"), json!("Price")],
-            vec![json!("A"), json!(2), json!(10.0)],
-            vec![json!("B"), json!("=B2*C2"), Value::Null],
-        ];
-        assert_eq!(report_numeric_columns(&rows, 1), vec![1, 2]);
+        let labels: Vec<Option<String>> =
+            ["REVENUE", "Product sales", "TOTAL REVENUE", "COST OF GOODS SOLD", "Raw materials", "TOTAL COGS", "GROSS PROFIT", "NET INCOME"]
+                .iter()
+                .map(|label| Some((*label).to_string()))
+                .collect();
+        let sections = vec![true, false, false, true, false, false, false, false];
+        let roles = report_row_roles(&labels, &sections);
+        assert_eq!(roles[0], ReportRowRole::Section);
+        assert_eq!(roles[1], ReportRowRole::LineItem);
+        assert_eq!(roles[2], ReportRowRole::Subtotal);
+        assert_eq!(roles[3], ReportRowRole::Section);
+        assert_eq!(roles[6], ReportRowRole::Subtotal);
+        assert_eq!(roles[7], ReportRowRole::GrandTotal);
 
-        let widths = report_column_widths(3, 38, 16, &Map::new());
-        assert_eq!(widths[0].1, 38);
-        assert_eq!(widths[1].1, 16);
-        let mut overrides = Map::new();
-        overrides.insert("B".into(), json!(42));
-        assert_eq!(report_column_widths(3, 38, 16, &overrides)[1].1, 42);
+        let spacers = report_spacer_after(&roles, &sections);
+        assert!(spacers[2], "one spacer after a section subtotal before the next section");
+        assert!(!spacers[5], "no free spacer before GROSS PROFIT, only section boundaries");
     }
 }

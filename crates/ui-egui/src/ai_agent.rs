@@ -5193,9 +5193,240 @@ fn execute_mcp_tool(
     }
 }
 
-/// Build a readable report from scratch: merged title, sized columns, number formats, section and
-/// total styling, optional chart, frozen header and print setup. Works through engine commands so
-/// it behaves exactly like a user using the ribbon.
+// ============================================================================
+// Layout engine: neutral, geometry-only final pass for `create_report` and `layout_sheet`.
+// No fills, font colours, table styles or themes are applied here; only structure, widths,
+// row heights, alignment, indent, number formats and functional horizontal borders.
+// ============================================================================
+
+/// Small command executor that records layout errors instead of failing the whole tool.
+#[cfg(not(target_arch = "wasm32"))]
+struct LayoutExec<'a> {
+    control_tx: &'a Option<Sender<ControlRequest>>,
+    ctx: &'a egui::Context,
+    errors: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<'a> LayoutExec<'a> {
+    fn new(control_tx: &'a Option<Sender<ControlRequest>>, ctx: &'a egui::Context) -> Self {
+        Self { control_tx, ctx, errors: Vec::new() }
+    }
+
+    fn run(&mut self, command: &str, params: Value) {
+        if let Err(error) = call_control(self.control_tx, self.ctx, "engine.execute", json!({"command": command, "params": params})) {
+            self.errors.push(format!("{command}: {error}"));
+        }
+    }
+
+    fn read(&mut self, range: &str) -> Vec<Vec<Value>> {
+        match call_control(self.control_tx, self.ctx, "sheet.read", json!({"range": range})) {
+            Ok(reply) => reply
+                .get("values")
+                .and_then(Value::as_array)
+                .map(|rows| rows.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect())
+                .unwrap_or_default(),
+            Err(error) => {
+                self.errors.push(format!("sheet.read {range}: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Insert blank rows so the following pass keeps every value/formula where it is semantically.
+    fn insert_rows(&mut self, at_row: u32, count: u32) {
+        self.run("home.insertRows", json!({"rows": format!("{at_row}:{at_row}"), "count": count}));
+    }
+
+    fn merge_across(&mut self, row: u32, last_col: &str) {
+        self.run("home.mergeCells", json!({"range": format!("A{row}:{last_col}{row}")}));
+    }
+
+    fn row_height(&mut self, row: u32, points: f32) {
+        self.run("home.rowHeight", json!({"rows": format!("{row}:{row}"), "points": points}));
+    }
+
+    fn border(&mut self, range: &str, preset: &str, style: &str) {
+        self.run("home.borders", json!({"range": range, "preset": preset, "style": style}));
+    }
+
+    fn indent(&mut self, range: &str, indent: u8) {
+        self.run("home.formatCells", json!({"range": range, "style": {"align": {"indent": indent}}}));
+    }
+
+    fn align(&mut self, range: &str, align: &str) {
+        let command = match align {
+            "Right" => "home.alignRight",
+            "Center" => "home.alignCenter",
+            _ => "home.alignLeft",
+        };
+        self.run(command, json!({"range": range}));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct LayoutDataRow {
+    /// Final 1-based sheet row.
+    sheet_row: u32,
+    role: crate::ai_tools::ReportRowRole,
+    /// True when a section heading appeared above: line items are indented only inside a section.
+    in_section: bool,
+    values: Vec<Value>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn layout_number_columns(kinds: &[crate::ai_tools::ReportColumnKind]) -> Vec<usize> {
+    kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| {
+            matches!(
+                kind,
+                crate::ai_tools::ReportColumnKind::Money | crate::ai_tools::ReportColumnKind::Quantity | crate::ai_tools::ReportColumnKind::Percent
+            )
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Apply the neutral table layout: functional borders, header styling, row hierarchy, alignment,
+/// indent, number formats, widths, row heights, frozen header and print fit.
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_table_layout(
+    exec: &mut LayoutExec,
+    headers: &[String],
+    data_rows: &[LayoutDataRow],
+    header_row: u32,
+    ncols: usize,
+) -> Vec<crate::ai_tools::ReportColumnKind> {
+    let last_col = crate::ai_tools::column_letters(ncols as u32 - 1);
+    let last_row = data_rows.iter().map(|row| row.sheet_row).max().unwrap_or(header_row);
+    let data_start = header_row + 1;
+
+    // Column kinds use the computed values (formulas already evaluated) and the header text.
+    let kinds: Vec<crate::ai_tools::ReportColumnKind> = (0..ncols)
+        .map(|col| {
+            let values: Vec<Value> = data_rows.iter().filter_map(|row| row.values.get(col).cloned()).collect();
+            crate::ai_tools::classify_report_column(headers.get(col).map(String::as_str).unwrap_or(""), &values)
+        })
+        .collect();
+
+    // The whole block is vertically centred; horizontal alignment follows the column kind so the
+    // header and every cell below it form one straight vertical line.
+    exec.run("home.alignMiddle", json!({"range": format!("A{header_row}:{last_col}{last_row}")}));
+    exec.border(&format!("A{header_row}:{last_col}{last_row}"), "none", "thin");
+    exec.run("home.bold", json!({"range": format!("A{data_start}:{last_col}{last_row}"), "on": false}));
+    exec.run("home.wrapText", json!({"range": format!("A{header_row}:{last_col}{header_row}"), "on": false}));
+
+    // Header row: bold, top thin + bottom medium, height 25pt.
+    let header_range = format!("A{header_row}:{last_col}{header_row}");
+    exec.run("home.bold", json!({"range": header_range, "on": true}));
+    exec.run("home.italic", json!({"range": header_range, "on": false}));
+    exec.row_height(header_row, 25.0);
+    exec.border(&header_range, "top", "thin");
+    exec.border(&header_range, "bottom", "medium");
+    for (col, kind) in kinds.iter().enumerate() {
+        let letters = crate::ai_tools::column_letters(col as u32);
+        exec.align(&format!("{letters}{header_row}"), kind.header_align());
+        exec.align(&format!("{letters}{data_start}:{letters}{last_row}"), kind.data_align());
+    }
+
+    // Row hierarchy: section headings bold left, line items regular (indented inside a section),
+    // subtotals bold with top+bottom thin borders, the grand total with a double bottom border.
+    for row in data_rows {
+        let full = format!("A{}:{last_col}{}", row.sheet_row, row.sheet_row);
+        let label = format!("A{}:A{}", row.sheet_row, row.sheet_row);
+        match row.role {
+            crate::ai_tools::ReportRowRole::Section => {
+                exec.indent(&label, 0);
+                exec.run("home.bold", json!({"range": label, "on": true}));
+                exec.row_height(row.sheet_row, 22.0);
+            }
+            crate::ai_tools::ReportRowRole::LineItem => {
+                exec.indent(&label, if row.in_section { 1 } else { 0 });
+                exec.row_height(row.sheet_row, 19.0);
+            }
+            crate::ai_tools::ReportRowRole::Subtotal => {
+                exec.indent(&label, 0);
+                exec.run("home.bold", json!({"range": full, "on": true}));
+                exec.row_height(row.sheet_row, 22.0);
+                exec.border(&full, "top", "thin");
+                exec.border(&full, "bottom", "thin");
+            }
+            crate::ai_tools::ReportRowRole::GrandTotal => {
+                exec.indent(&label, 0);
+                exec.run("home.bold", json!({"range": full, "on": true}));
+                exec.row_height(row.sheet_row, 24.0);
+                exec.border(&full, "top", "thin");
+                exec.border(&full, "bottom", "double");
+            }
+        }
+    }
+
+    // Number formats on the numeric columns (no `.00` for whole money/quantities, one decimal for
+    // percentages), then widths from the FORMATTED display length with a safe +6 padding gap.
+    for col in layout_number_columns(&kinds) {
+        let letters = crate::ai_tools::column_letters(col as u32);
+        let values: Vec<Value> = data_rows.iter().filter_map(|row| row.values.get(col).cloned()).collect();
+        let format = kinds[col].number_format(crate::ai_tools::report_money_has_cents(&values));
+        exec.run("home.numberFormat", json!({"range": format!("{letters}{data_start}:{letters}{last_row}"), "format": format}));
+    }
+    for (col, kind) in kinds.iter().enumerate() {
+        let values: Vec<Value> = data_rows.iter().filter_map(|row| row.values.get(col).cloned()).collect();
+        let width = crate::ai_tools::report_column_width(headers.get(col).map(String::as_str).unwrap_or(""), &values, *kind);
+        let letters = crate::ai_tools::column_letters(col as u32);
+        exec.run("home.columnWidth", json!({"cols": letters, "chars": width}));
+    }
+
+    // Freeze exactly below the column header row, and fit print output to one page wide.
+    exec.run("view.freezePanes", json!({"cell": format!("A{}", header_row + 1)}));
+    exec.run("pageLayout.printArea", json!({"range": format!("A1:{last_col}{last_row}")}));
+    exec.run(
+        "pageLayout.pageSetup",
+        json!({
+            "orientation": if ncols > 6 { "landscape" } else { "portrait" },
+            "fitToPage": true,
+            "fitWidth": 1,
+            "fitHeight": 0
+        }),
+    );
+
+    kinds
+}
+
+/// Style the merged title/subtitle block above the table. No border, no fill, left aligned (never
+/// right), bold 15pt title and italic 11pt subtitle; exactly one 10pt blank spacer sits before the
+/// header row (created by the caller through row insertion).
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_title_block(exec: &mut LayoutExec, title_row: Option<u32>, subtitle_row: Option<u32>, spacer_row: Option<u32>, last_col: &str) {
+    if let Some(row) = title_row {
+        exec.merge_across(row, last_col);
+        exec.align(&format!("A{row}"), "Left");
+        exec.run("home.alignMiddle", json!({"range": format!("A{row}")}));
+        exec.run("home.bold", json!({"range": format!("A{row}"), "on": true}));
+        exec.run("home.italic", json!({"range": format!("A{row}"), "on": false}));
+        exec.run("home.fontSize", json!({"range": format!("A{row}"), "size": 15}));
+        exec.run("home.borders", json!({"range": format!("A{row}:{last_col}{row}"), "preset": "none"}));
+        exec.row_height(row, 27.0);
+    }
+    if let Some(row) = subtitle_row {
+        exec.merge_across(row, last_col);
+        exec.align(&format!("A{row}"), "Left");
+        exec.run("home.alignMiddle", json!({"range": format!("A{row}")}));
+        exec.run("home.bold", json!({"range": format!("A{row}"), "on": false}));
+        exec.run("home.italic", json!({"range": format!("A{row}"), "on": true}));
+        exec.run("home.fontSize", json!({"range": format!("A{row}"), "size": 11}));
+        exec.run("home.borders", json!({"range": format!("A{row}:{last_col}{row}"), "preset": "none"}));
+        exec.row_height(row, 19.0);
+    }
+    if let Some(row) = spacer_row {
+        exec.run("home.borders", json!({"range": format!("A{row}:{last_col}{row}"), "preset": "none"}));
+        exec.row_height(row, 10.0);
+    }
+}
+
+/// Build a clean report from scratch through the neutral layout engine.
 #[cfg(not(target_arch = "wasm32"))]
 fn create_report_tool(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::Context, a: &Map<String, Value>) -> Result<Value, String> {
     let headers: Vec<String> = a
@@ -5216,175 +5447,143 @@ fn create_report_tool(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::C
     let ncols = headers.len().max(rows_in.iter().map(Vec::len).max().unwrap_or(0)).max(2);
     let title = a.get("title").and_then(Value::as_str).unwrap_or("");
     let subtitle = a.get("subtitle").and_then(Value::as_str).unwrap_or("");
-    let number_format = a.get("number_format").and_then(Value::as_str).unwrap_or("#,##0.00");
-    let label_width = a.get("label_width").and_then(Value::as_u64).unwrap_or(38).clamp(12, 120) as u32;
-    let number_width = a.get("number_width").and_then(Value::as_u64).unwrap_or(16).clamp(8, 60) as u32;
-    let overrides = a.get("column_widths").and_then(Value::as_object).cloned().unwrap_or_default();
     let freeze = a.get("freeze_header").and_then(Value::as_bool).unwrap_or(true);
     let print = a.get("print_setup").and_then(Value::as_bool).unwrap_or(true);
-    let table_style = a.get("table_style").and_then(Value::as_bool).unwrap_or(false);
+    let last_col = crate::ai_tools::column_letters(ncols as u32 - 1);
 
-    let mut errors: Vec<String> = Vec::new();
-    {
-        let mut run = |cmd: &str, params: Value| {
-            if let Err(e) = call_control(control_tx, ctx, "engine.execute", json!({"command": cmd, "params": params})) {
-                errors.push(format!("{cmd}: {e}"));
-            }
-        };
+    let mut exec = LayoutExec::new(control_tx, ctx);
+    let padded_header: Vec<Value> = (0..ncols).map(|col| headers.get(col).map(|h| Value::String(h.clone())).unwrap_or(Value::Null)).collect();
+    let padded_rows: Vec<Vec<Value>> =
+        rows_in.iter().map(|data| (0..ncols).map(|col| data.get(col).cloned().unwrap_or(Value::Null)).collect()).collect();
 
-        let last_col = crate::ai_tools::column_letters(ncols as u32 - 1);
-        let mut row = 1u32;
-        if !title.is_empty() {
-            run("range.setValues", json!({"range": "A1", "values": [[title]]}));
-            run("home.mergeCenter", json!({"range": format!("A1:{last_col}1")}));
-            run("home.bold", json!({"range": "A1", "on": true}));
-            run("home.fontSize", json!({"range": "A1", "size": 15}));
-            run("home.fillColor", json!({"range": "A1", "color": "#1F9D55"}));
-            run("home.fontColor", json!({"range": "A1", "color": "#FFFFFF"}));
-            run("home.rowHeight", json!({"rows": "1:1", "points": 26}));
-            row += 1;
-        }
-        if !subtitle.is_empty() {
-            let range = format!("A{row}:{last_col}{row}");
-            run("range.setValues", json!({"range": format!("A{row}"), "values": [[subtitle]]}));
-            run("home.mergeCenter", json!({"range": range}));
-            run("home.italic", json!({"range": format!("A{row}"), "on": true}));
-            run("home.fontColor", json!({"range": format!("A{row}"), "color": "#666666"}));
-            row += 1;
-        }
-        let header_row = row;
-        let data_start = header_row + 1;
-        let last_row = data_start + rows_in.len() as u32 - 1;
+    // 1) Values first: header + data rows are written contiguously from A1. Formulas are computed
+    //    before the final layout pass so widths use the real display values.
+    exec.run("range.setValues", json!({"range": "A1", "values": [padded_header]}));
+    exec.run("range.setValues", json!({"range": "A2", "values": padded_rows}));
 
-        let padded_header: Vec<Value> = (0..ncols).map(|col| headers.get(col).map(|h| Value::String(h.clone())).unwrap_or(Value::Null)).collect();
-        run("range.setValues", json!({"range": format!("A{header_row}"), "values": [padded_header]}));
-        let padded_rows: Vec<Vec<Value>> =
-            rows_in.iter().map(|data| (0..ncols).map(|col| data.get(col).cloned().unwrap_or(Value::Null)).collect()).collect();
-        run("range.setValues", json!({"range": format!("A{data_start}"), "values": padded_rows}));
-
-        let header_range = format!("A{header_row}:{last_col}{header_row}");
-        run("home.bold", json!({"range": header_range, "on": true}));
-        run("home.fillColor", json!({"range": header_range, "color": "#D9EAD3"}));
-        run("home.alignCenter", json!({"range": header_range}));
-        run("home.wrapText", json!({"range": header_range, "on": true}));
-        run("home.borders", json!({"range": header_range, "preset": "bottom", "style": "medium"}));
-
-        let detected_numeric = crate::ai_tools::report_numeric_columns(&padded_rows, 1);
-        let numeric_columns = if detected_numeric.is_empty() { vec![1.min(ncols - 1)] } else { detected_numeric };
-        for col in &numeric_columns {
-            let letters = crate::ai_tools::column_letters(*col as u32);
-            let range = format!("{letters}{data_start}:{letters}{last_row}");
-            run("home.numberFormat", json!({"range": range, "format": number_format}));
-            run("home.alignRight", json!({"range": range}));
+    // 2) Section spacer rows between a closed section (total row) and the next section heading.
+    let labels: Vec<Option<String>> = padded_rows.iter().map(|row| row.first().and_then(Value::as_str).map(str::to_string)).collect();
+    let sections = crate::ai_tools::report_section_flags(&padded_rows);
+    let roles = crate::ai_tools::report_row_roles(&labels, &sections);
+    let spacers = crate::ai_tools::report_spacer_after(&roles, &sections);
+    for index in (0..spacers.len()).rev() {
+        if spacers[index] {
+            exec.insert_rows(2 + index as u32 + 1, 1);
         }
-        run("home.wrapText", json!({"range": format!("A{data_start}:A{last_row}"), "on": true}));
-        run("home.alignLeft", json!({"range": format!("A{data_start}:A{last_row}")}));
-        for (letters, chars) in crate::ai_tools::report_column_widths(ncols, label_width, number_width, &overrides) {
-            run("home.columnWidth", json!({"cols": letters, "chars": chars}));
-        }
-
-        let explicit_sections: Option<Vec<usize>> = a
-            .get("section_rows")
-            .and_then(Value::as_array)
-            .map(|rows| rows.iter().filter_map(|value| value.as_u64().map(|index| index as usize)).collect());
-        let sections = explicit_sections.unwrap_or_else(|| {
-            padded_rows.iter().enumerate().filter(|(_, data)| crate::ai_tools::report_is_section_row(data)).map(|(index, _)| index).collect()
-        });
-        for index in &sections {
-            let sheet_row = data_start + *index as u32;
-            let range = format!("A{sheet_row}:{last_col}{sheet_row}");
-            run("home.bold", json!({"range": format!("A{sheet_row}"), "on": true}));
-            run("home.fillColor", json!({"range": range, "color": "#F2F2F2"}));
-        }
-        let explicit_totals: Option<Vec<usize>> = a
-            .get("total_rows")
-            .and_then(Value::as_array)
-            .map(|rows| rows.iter().filter_map(|value| value.as_u64().map(|index| index as usize)).collect());
-        let totals = explicit_totals.unwrap_or_else(|| {
-            padded_rows
-                .iter()
-                .enumerate()
-                .filter(|(_, data)| data.first().and_then(Value::as_str).is_some_and(crate::ai_tools::report_is_total_label))
-                .map(|(index, _)| index)
-                .collect()
-        });
-        for index in &totals {
-            let sheet_row = data_start + *index as u32;
-            let range = format!("A{sheet_row}:{last_col}{sheet_row}");
-            run("home.bold", json!({"range": range, "on": true}));
-            run("home.fillColor", json!({"range": range, "color": "#F3F3F3"}));
-            run("home.borders", json!({"range": format!("A{sheet_row}:{last_col}{sheet_row}"), "preset": "top", "style": "thin"}));
-            run("home.borders", json!({"range": format!("A{sheet_row}:{last_col}{sheet_row}"), "preset": "doubleBottom", "style": "double"}));
-        }
-        let table_range = format!("A{header_row}:{last_col}{last_row}");
-        run("home.borders", json!({"range": table_range, "preset": "outside"}));
-        if table_style {
-            run("insert.table", json!({"range": table_range, "style": "TableStyleMedium2"}));
-        }
-
-        if freeze {
-            run("view.freezePanes", json!({"cell": format!("A{}", header_row + 1)}));
-        }
-        if print {
-            run("pageLayout.printArea", json!({"range": format!("A1:{last_col}{last_row}")}));
-            run(
-                "pageLayout.pageSetup",
-                json!({
-                    "orientation": if ncols > 6 { "landscape" } else { "portrait" },
-                    "fitToPage": true,
-                    "fitWidth": 1,
-                    "fitHeight": 0,
-                    "centerH": true
-                }),
-            );
-        }
-
-        let mut chart_value = Value::Null;
-        if let Some(chart) = a.get("chart").and_then(Value::as_object) {
-            let chart_type = chart.get("type").and_then(Value::as_str).unwrap_or("column");
-            let chart_title = chart.get("title").and_then(Value::as_str).unwrap_or(if title.is_empty() { "Chart" } else { title });
-            let anchor = chart
-                .get("at")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{}{}", crate::ai_tools::column_letters(ncols as u32 + 1), header_row));
-            let mut ranges = vec![format!("A{data_start}:A{last_row}")];
-            for col in numeric_columns.iter().take(3) {
-                let letters = crate::ai_tools::column_letters(*col as u32);
-                ranges.push(format!("{letters}{data_start}:{letters}{last_row}"));
-            }
-            chart_value = json!({"range": ranges.join(","), "type": chart_type, "title": chart_title, "at": anchor});
-            run(
-                "insert.chart",
-                json!({"range": ranges.join(","), "type": chart_type, "title": chart_title, "at": anchor, "width": 520, "height": 320}),
-            );
-        }
-
-        Ok(json!({
-            "ok": errors.is_empty(),
-            "headerRow": header_row,
-            "dataStartRow": data_start,
-            "lastRow": last_row,
-            "columns": ncols,
-            "numericColumns": numeric_columns.iter().map(|col| crate::ai_tools::column_letters(*col as u32)).collect::<Vec<_>>(),
-            "sectionRows": sections.iter().map(|index| data_start + *index as u32).collect::<Vec<_>>(),
-            "totalRows": totals.iter().map(|index| data_start + *index as u32).collect::<Vec<_>>(),
-            "chart": chart_value,
-            "errors": errors
-        }))
     }
+
+    // 3) Title block above the table: title row, subtitle row and exactly one blank 10pt spacer
+    //    before the header row. Inserting rows here keeps every formula reference correct.
+    let has_title = !title.is_empty();
+    let has_subtitle = !subtitle.is_empty();
+    let top_rows = if has_title || has_subtitle { 1 + has_title as u32 + has_subtitle as u32 } else { 0 };
+    if top_rows > 0 {
+        exec.insert_rows(1, top_rows);
+    }
+    let header_row = 1 + top_rows;
+    let data_start = header_row + 1;
+    let title_row = has_title.then_some(1);
+    let subtitle_row = has_subtitle.then_some(1 + has_title as u32);
+    let spacer_row = (has_title || has_subtitle).then_some(1 + has_title as u32 + has_subtitle as u32);
+    if has_title || has_subtitle {
+        exec.run("range.setValues", json!({"range": "A1", "values": [[if has_title { title } else { subtitle }]]}));
+        if has_title && has_subtitle {
+            exec.run("range.setValues", json!({"range": "A2", "values": [[subtitle]]}));
+        }
+    }
+    apply_title_block(&mut exec, title_row, subtitle_row, spacer_row, &last_col);
+
+    // 4) Final positions (row mapping) and the computed values read back after all insertions.
+    let mut final_rows = Vec::with_capacity(padded_rows.len());
+    let mut inserted_before = 0u32;
+    let mut last_row = data_start.saturating_sub(1);
+    for (index, _) in padded_rows.iter().enumerate() {
+        let sheet_row = data_start + index as u32 + inserted_before;
+        final_rows.push(sheet_row);
+        last_row = sheet_row;
+        if spacers.get(index).copied().unwrap_or(false) {
+            inserted_before += 1;
+            exec.row_height(sheet_row + 1, 10.0);
+        }
+    }
+    let read_values = exec.read(&format!("A{header_row}:{last_col}{last_row}"));
+    let data_rows: Vec<LayoutDataRow> = padded_rows
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let offset = (final_rows[index] - header_row) as usize;
+            LayoutDataRow {
+                sheet_row: final_rows[index],
+                role: roles.get(index).copied().unwrap_or(crate::ai_tools::ReportRowRole::LineItem),
+                in_section: sections.iter().take(index).any(|flag| *flag),
+                values: read_values.get(offset).cloned().unwrap_or_default(),
+            }
+        })
+        .collect();
+
+    let kinds = apply_table_layout(&mut exec, &headers, &data_rows, header_row, ncols);
+    if !freeze {
+        exec.run("view.freezePanes", json!({}));
+    }
+    if !print {
+        exec.run("pageLayout.printArea", json!({"clear": true}));
+    }
+
+    // Optional neutral chart (default GridCraft palette; no report colours are forced).
+    let mut chart_value = Value::Null;
+    if let Some(chart) = a.get("chart").and_then(Value::as_object) {
+        let chart_type = chart.get("type").and_then(Value::as_str).unwrap_or("column");
+        let chart_title = chart.get("title").and_then(Value::as_str).unwrap_or(if title.is_empty() { "Chart" } else { title });
+        let anchor = chart
+            .get("at")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}{}", crate::ai_tools::column_letters(ncols as u32 + 1), header_row));
+        let mut ranges = vec![format!("A{data_start}:A{last_row}")];
+        for col in layout_number_columns(&kinds).into_iter().take(3) {
+            let letters = crate::ai_tools::column_letters(col as u32);
+            ranges.push(format!("{letters}{data_start}:{letters}{last_row}"));
+        }
+        chart_value = json!({"range": ranges.join(","), "type": chart_type, "title": chart_title, "at": anchor});
+        exec.run(
+            "insert.chart",
+            json!({"range": ranges.join(","), "type": chart_type, "title": chart_title, "at": anchor, "width": 520, "height": 320}),
+        );
+    }
+
+    Ok(json!({
+        "ok": exec.errors.is_empty(),
+        "headerRow": header_row,
+        "dataStartRow": data_start,
+        "lastRow": last_row,
+        "columns": ncols,
+        "columnKinds": kinds.iter().map(|kind| format!("{kind:?}")).collect::<Vec<_>>(),
+        "titleRows": title_row.into_iter().chain(subtitle_row).collect::<Vec<_>>(),
+        "spacerRows": (0..spacers.len()).filter(|index| spacers[*index]).map(|index| final_rows[index] + 1).collect::<Vec<_>>(),
+        "totalRows": data_rows.iter().filter(|row| matches!(row.role, crate::ai_tools::ReportRowRole::Subtotal | crate::ai_tools::ReportRowRole::GrandTotal)).map(|row| row.sheet_row).collect::<Vec<_>>(),
+        "chart": chart_value,
+        "errors": exec.errors
+    }))
 }
 
-/// Lay out an existing (possibly cramped) range without rewriting its values: readable column
-/// widths, number formats, alignment, header/total styling, borders, frozen header and print setup.
+/// Repair an existing range with the same neutral layout pass, without changing any value/formula:
+/// title merge/alignment, readable widths, row heights, indent hierarchy, number formats, functional
+/// borders, frozen header and print fit. Missing blanks (below a subtitle, between sections) are
+/// inserted with `home.insertRows`, which shifts formulas correctly.
 #[cfg(not(target_arch = "wasm32"))]
 fn layout_sheet_tool(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::Context, a: &Map<String, Value>) -> Result<Value, String> {
+    let mut exec = LayoutExec::new(control_tx, ctx);
     let read_params = match a.get("range") {
         Some(range) => json!({"range": range}),
         None => json!({}),
     };
-    let read = call_control(control_tx, ctx, "sheet.read", read_params)?;
-    let values: Vec<Vec<Value>> = read
+    let first = call_control(control_tx, ctx, "sheet.read", read_params)?;
+    let range_text = first.get("range").and_then(Value::as_str).unwrap_or("A1").to_string();
+    let parsed = RangeRef::parse(split_sheet(&range_text).1).ok_or_else(|| format!("cannot parse range `{range_text}`"))?;
+    let start_col = parsed.start.col;
+    let start_row = parsed.start.row + 1;
+    let mut end_row = parsed.end.row + 1;
+    let mut values: Vec<Vec<Value>> = first
         .get("values")
         .and_then(Value::as_array)
         .map(|rows| rows.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect())
@@ -5392,123 +5591,103 @@ fn layout_sheet_tool(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::Co
     if values.is_empty() {
         return Err("the range is empty; write data first".into());
     }
-    let range_text = read.get("range").and_then(Value::as_str).unwrap_or("A1").to_string();
-    let parsed = RangeRef::parse(split_sheet(&range_text).1).ok_or_else(|| format!("cannot parse range `{range_text}`"))?;
-    let start_col = parsed.start.col;
-    let start_row = parsed.start.row + 1;
-    let end_row = parsed.end.row + 1;
-    let ncols = values.iter().map(Vec::len).max().unwrap_or(0).max((parsed.end.col - parsed.start.col + 1) as usize).max(1);
-    let number_format = a.get("number_format").and_then(Value::as_str).unwrap_or("#,##0.00");
-    let label_col = a.get("label_column").and_then(Value::as_str).and_then(|text| text.trim().chars().next()).unwrap_or('A');
-    let header_row = a.get("header_row").and_then(Value::as_u64).map(|value| value as u32).unwrap_or(start_row);
+    let ncols = values.iter().map(Vec::len).max().unwrap_or(1).max((parsed.end.col - parsed.start.col + 1) as usize).max(1);
 
-    let mut errors: Vec<String> = Vec::new();
-    {
-        let mut run = |cmd: &str, params: Value| {
-            if let Err(e) = call_control(control_tx, ctx, "engine.execute", json!({"command": cmd, "params": params})) {
-                errors.push(format!("{cmd}: {e}"));
+    let non_empty =
+        |row: &[Value]| row.iter().filter(|cell| !cell.is_null() && cell.as_str().map(|text| !text.trim().is_empty()).unwrap_or(true)).count();
+    let mut header_row = a.get("header_row").and_then(Value::as_u64).map(|value| value as u32).unwrap_or_else(|| {
+        values.iter().enumerate().find(|(_, row)| non_empty(row) >= 2).map(|(index, _)| start_row + index as u32).unwrap_or(start_row)
+    });
+
+    // One blank 10pt spacer below the subtitle, when the table header directly follows it.
+    if header_row > start_row {
+        let above_index = (header_row - start_row) as usize - 1;
+        let above_empty = values.get(above_index).map(|row| non_empty(row) == 0).unwrap_or(true);
+        if !above_empty && values.get((header_row - start_row) as usize).map(|row| non_empty(row)).unwrap_or(0) > 0 {
+            exec.insert_rows(header_row, 1);
+            header_row += 1;
+            end_row += 1;
+            let reread = exec.read(&format!("A{start_row}:{}{end_row}", crate::ai_tools::column_letters(start_col + ncols as u32 - 1)));
+            if !reread.is_empty() {
+                values = reread;
             }
-        };
-
-        if let Some(title_range) = a.get("title_range").and_then(Value::as_str) {
-            run("home.mergeCenter", json!({"range": title_range}));
-            run("home.bold", json!({"range": title_range, "on": true}));
-            run("home.fontSize", json!({"range": title_range, "size": 15}));
         }
-
-        let data_start = header_row + 1;
-        let last_col_letters = crate::ai_tools::column_letters(start_col + ncols as u32 - 1);
-        if data_start <= end_row {
-            let header_range = format!("{label_col}{header_row}:{last_col_letters}{header_row}");
-            run("home.bold", json!({"range": header_range, "on": true}));
-            run("home.fillColor", json!({"range": header_range, "color": "#D9EAD3"}));
-            run("home.wrapText", json!({"range": header_range, "on": true}));
-            run("home.alignCenter", json!({"range": header_range}));
-        }
-
-        let explicit_number_cols: Option<Vec<u32>> = a.get("number_columns").and_then(Value::as_array).map(|cols| {
-            cols.iter()
-                .filter_map(Value::as_str)
-                .filter_map(|text| text.trim().chars().next())
-                .map(|ch| (ch.to_ascii_uppercase() as u32).saturating_sub('A' as u32))
-                .collect()
-        });
-        let numeric_columns: Vec<u32> = explicit_number_cols.unwrap_or_else(|| {
-            let skip_rows = ((header_row.saturating_sub(start_row)) + 1) as usize;
-            let rows: Vec<Vec<Value>> = values.iter().skip(skip_rows).cloned().collect();
-            crate::ai_tools::report_numeric_columns(&rows, 1).into_iter().map(|col| start_col + col as u32).collect()
-        });
-        for col in &numeric_columns {
-            let letters = crate::ai_tools::column_letters(*col);
-            let range = format!("{letters}{data_start}:{letters}{end_row}");
-            run("home.numberFormat", json!({"range": range, "format": number_format}));
-            run("home.alignRight", json!({"range": range}));
-        }
-        run("home.wrapText", json!({"range": format!("{label_col}{data_start}:{label_col}{end_row}"), "on": true}));
-
-        let autofit = a.get("autofit_widths").and_then(Value::as_bool).unwrap_or(true);
-        for col in start_col..start_col + ncols as u32 {
-            let letters = crate::ai_tools::column_letters(col);
-            let chars = if autofit {
-                values
-                    .iter()
-                    .filter_map(|row| row.get((col - start_col) as usize))
-                    .map(|cell| match cell {
-                        Value::String(text) => text.chars().count() as u32,
-                        Value::Null => 6,
-                        _ => 16,
-                    })
-                    .max()
-                    .unwrap_or(12)
-                    .clamp(10, 60)
-            } else if col == start_col + (label_col as u32).saturating_sub('A' as u32) {
-                38
-            } else {
-                16
-            };
-            run("home.columnWidth", json!({"cols": letters, "chars": chars}));
-        }
-
-        let explicit_totals: Option<Vec<u32>> =
-            a.get("total_rows").and_then(Value::as_array).map(|rows| rows.iter().filter_map(Value::as_u64).map(|row| row as u32).collect());
-        let totals: Vec<u32> = explicit_totals.unwrap_or_else(|| {
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, row)| (start_row + index as u32, row))
-                .filter(|(sheet_row, _)| *sheet_row > header_row)
-                .filter(|(_, row)| row.first().and_then(Value::as_str).is_some_and(crate::ai_tools::report_is_total_label))
-                .map(|(sheet_row, _)| sheet_row)
-                .collect()
-        });
-        for sheet_row in &totals {
-            let range = format!("{label_col}{sheet_row}:{last_col_letters}{sheet_row}");
-            run("home.bold", json!({"range": range, "on": true}));
-            run("home.borders", json!({"range": range, "preset": "top", "style": "thin"}));
-            run("home.borders", json!({"range": range, "preset": "doubleBottom", "style": "double"}));
-        }
-        let table_range = format!("A{header_row}:{last_col_letters}{end_row}");
-        run("home.borders", json!({"range": table_range, "preset": "outside"}));
-        if a.get("freeze_header").and_then(Value::as_bool).unwrap_or(true) {
-            run("view.freezePanes", json!({"cell": format!("{label_col}{}", header_row + 1)}));
-        }
-        if a.get("print_setup").and_then(Value::as_bool).unwrap_or(true) {
-            run("pageLayout.printArea", json!({"range": format!("A{start_row}:{last_col_letters}{end_row}")}));
-            run(
-                "pageLayout.pageSetup",
-                json!({"orientation": if ncols > 6 { "landscape" } else { "portrait" }, "fitToPage": true, "fitWidth": 1, "fitHeight": 0, "centerH": true}),
-            );
-        }
-
-        Ok(json!({
-            "ok": errors.is_empty(),
-            "range": range_text,
-            "headerRow": header_row,
-            "numericColumns": numeric_columns.iter().map(|col| crate::ai_tools::column_letters(*col)).collect::<Vec<_>>(),
-            "totalRows": totals,
-            "errors": errors
-        }))
     }
+
+    let data_start = header_row + 1;
+    let read_rows: Vec<(u32, Vec<Value>)> = values
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (start_row + index as u32, row.clone()))
+        .filter(|(sheet_row, _)| *sheet_row >= data_start && *sheet_row <= end_row)
+        .collect();
+    let row_labels: Vec<Option<String>> = read_rows.iter().map(|(_, row)| row.first().and_then(Value::as_str).map(str::to_string)).collect();
+    let row_values: Vec<Vec<Value>> = read_rows.iter().map(|(_, row)| row.clone()).collect();
+    let sections = crate::ai_tools::report_section_flags(&row_values);
+    let roles = crate::ai_tools::report_row_roles(&row_labels, &sections);
+    let spacers = crate::ai_tools::report_spacer_after(&roles, &sections);
+
+    // Insert the section spacer rows from the bottom up so earlier positions stay valid.
+    let mut inserted_after: Vec<u32> = vec![0; read_rows.len()];
+    for index in (0..spacers.len()).rev() {
+        if spacers[index] {
+            exec.insert_rows(read_rows[index].0 + 1, 1);
+            inserted_after[index] = 1;
+            end_row += 1;
+        }
+    }
+    let mut shift = 0u32;
+    let mut spacer_rows: Vec<u32> = Vec::new();
+    let mut data_rows = Vec::new();
+    for (index, (sheet_row, row)) in read_rows.iter().enumerate() {
+        let final_row = sheet_row + shift;
+        if inserted_after[index] == 1 {
+            exec.row_height(final_row + 1, 10.0);
+            spacer_rows.push(final_row + 1);
+            shift += 1;
+        }
+        data_rows.push(LayoutDataRow {
+            sheet_row: final_row,
+            role: roles.get(index).copied().unwrap_or(crate::ai_tools::ReportRowRole::LineItem),
+            in_section: sections.iter().take(index).any(|flag| *flag),
+            values: row.clone(),
+        });
+    }
+
+    // Title/subtitle above the table: merge across the table, left aligned, no border, bold/italic.
+    let title_rows: Vec<u32> = (start_row..header_row)
+        .filter(|row| {
+            let index = (row - start_row) as usize;
+            values.get(index).is_some_and(|cells| non_empty(cells) > 0)
+        })
+        .collect();
+    if let Some(title_row) = title_rows.first() {
+        let last_col = crate::ai_tools::column_letters(start_col + ncols as u32 - 1);
+        let subtitle_row = title_rows.get(1).copied();
+        apply_title_block(&mut exec, Some(*title_row), subtitle_row, None, &last_col);
+        if let Some(spacer) =
+            (title_row + 1..header_row).find(|row| values.get((row - start_row) as usize).is_some_and(|cells| non_empty(cells) == 0))
+        {
+            exec.row_height(spacer, 10.0);
+        }
+    }
+
+    let headers: Vec<String> = (0..ncols)
+        .map(|col| values.get((header_row - start_row) as usize).and_then(|row| row.get(col)).and_then(Value::as_str).unwrap_or("").to_string())
+        .collect();
+    let kinds = apply_table_layout(&mut exec, &headers, &data_rows, header_row, ncols);
+
+    Ok(json!({
+        "ok": exec.errors.is_empty(),
+        "range": format!("A{start_row}:{}{end_row}", crate::ai_tools::column_letters(start_col + ncols as u32 - 1)),
+        "headerRow": header_row,
+        "dataStartRow": header_row + 1,
+        "lastRow": data_rows.iter().map(|row| row.sheet_row).max().unwrap_or(header_row),
+        "columnKinds": kinds.iter().map(|kind| format!("{kind:?}")).collect::<Vec<_>>(),
+        "totalRows": data_rows.iter().filter(|row| matches!(row.role, crate::ai_tools::ReportRowRole::Subtotal | crate::ai_tools::ReportRowRole::GrandTotal)).map(|row| row.sheet_row).collect::<Vec<_>>(),
+        "spacerRows": spacer_rows,
+        "errors": exec.errors
+    }))
 }
 
 // ============================================================================
