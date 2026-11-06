@@ -138,6 +138,13 @@ discovered at runtime, so they are usable by the agent without changing the pane
   and chart-substitution heuristics are off. A malformed `ai.deep_clear` range is reported as an
   error instead of clearing the whole sheet.
 
+## Timeouts
+
+Chat generations have **no request timeout**: the HTTP call to the provider (or local Ollama) and the
+Terminal CLI turn wait as long as the model needs. Cancel/Stop still aborts them immediately, and
+genuine LLM errors (HTTP status, auth/quota/model errors, network loss, invalid JSON) are still
+reported. Only the short health probes keep a timeout: loading a model list and verifying a model
+connection give up after a few seconds so a dead endpoint does not block the pane.
 ## Privacy
 
 The pane only talks to the backend the user configures. There is no telemetry; local Ollama keeps

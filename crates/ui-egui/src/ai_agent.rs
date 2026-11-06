@@ -5651,7 +5651,7 @@ fn run_api_agent_loop(
             })
         };
 
-        let resp = match http_post_json(&endpoint, provider, api_key, &body, cancel, is_local, 90) {
+        let resp = match http_post_json(&endpoint, provider, api_key, &body, cancel, is_local, 0) {
             Ok(v) => v,
             Err(e) => {
                 let lower = e.to_ascii_lowercase();
@@ -5883,7 +5883,7 @@ fn cli_agent_args(cli_agent: CliAgent, cli_model: &str, prompt: &str) -> (Vec<St
                 "--disable-slash-commands".into(),
                 "--dangerously-skip-permissions".into(),
                 "--print-timeout".into(),
-                "75s".into(),
+                "3600s".into(),
             ];
             if !cli_model.is_empty() && cli_model != "default" {
                 a.push("--model".into());
@@ -6040,7 +6040,7 @@ fn run_cli_agent_turn(
         let (args, use_stdin) = cli_agent_args(cli_agent, cli_model, &prompt_for_attempt);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let stdin_bytes = if use_stdin { Some(prompt_for_attempt.as_bytes()) } else { None };
-        match run_process_cancellable_with_stdin(cmd_name, &arg_refs, stdin_bytes, work_dir.as_deref(), cancel, false, 120) {
+        match run_process_cancellable_with_stdin(cmd_name, &arg_refs, stdin_bytes, work_dir.as_deref(), cancel, false, 0) {
             Ok(output) => {
                 if cancel.load(Ordering::SeqCst) {
                     return;
@@ -6172,17 +6172,14 @@ fn http_post_json(
     let body_bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
     std::fs::write(&req_path, &body_bytes).map_err(|e| format!("temp file write: {e}"))?;
 
-    let max_time_str = timeout_secs.to_string();
-    let mut args: Vec<String> = vec![
-        "-sS".into(),
-        "--max-time".into(),
-        max_time_str,
-        "-X".into(),
-        "POST".into(),
-        url.to_string(),
-        "-H".into(),
-        "Content-Type: application/json".into(),
-    ];
+    // A timeout of 0 means "no request timeout": a slow local model may take as long as it needs.
+    // Cancel/Stop still aborts the process, and real HTTP/network/model errors are still reported.
+    let mut args: Vec<String> = vec!["-sS".into()];
+    if timeout_secs > 0 {
+        args.push("--max-time".into());
+        args.push(timeout_secs.to_string());
+    }
+    args.extend(["-X".into(), "POST".into(), url.to_string(), "-H".into(), "Content-Type: application/json".into()]);
 
     if provider == ApiProvider::Anthropic {
         args.push("-H".into());
@@ -6206,7 +6203,15 @@ fn http_post_json(
 
     let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let res = run_process_cancellable_with_stdin(curl_bin, &arg_refs, None, None, cancel, is_local, timeout_secs.saturating_add(5));
+    let res = run_process_cancellable_with_stdin(
+        curl_bin,
+        &arg_refs,
+        None,
+        None,
+        cancel,
+        is_local,
+        if timeout_secs == 0 { 0 } else { timeout_secs.saturating_add(5) },
+    );
     let _ = std::fs::remove_file(&req_path);
 
     let out = res?;
@@ -6351,7 +6356,7 @@ fn run_process_cancellable_with_stdin(
 
     let start = Instant::now();
     let mut last_net_check = Instant::now();
-    let max_dur = Duration::from_secs(timeout_secs.max(5));
+    let max_dur = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs.max(5)));
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -6383,7 +6388,7 @@ fn run_process_cancellable_with_stdin(
                 return Err(if stderr.is_empty() { format!("Process `{program}` exited with status {status}") } else { stderr });
             }
             Ok(None) => {
-                if start.elapsed() > max_dur {
+                if max_dur.is_some_and(|limit| start.elapsed() > limit) {
                     kill_process_tree(&mut child);
                     let partial_out = stdout_buf.lock().map(|g| String::from_utf8_lossy(&g).trim().to_string()).unwrap_or_default();
                     let partial_err = stderr_buf.lock().map(|g| String::from_utf8_lossy(&g).trim().to_string()).unwrap_or_default();
