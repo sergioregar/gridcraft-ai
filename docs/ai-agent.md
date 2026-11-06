@@ -41,6 +41,27 @@ catalog is capped (12,000 characters for cloud/terminal agents, 5,000 for local 
 models get the catalog plus a short "take one step at a time" note instead of the full guide and
 recipe sheet. This keeps small local models focused on the task instead of drowning in prompt text.
 
+The prompt is deliberately light: the ground rules and the system prompt are compact, the command
+catalog is capped (12,000 characters for cloud/terminal agents, 5,000 for local Ollama), and local
+models get the catalog plus a short "take one step at a time" note instead of the full guide and
+recipe sheet. This keeps small local models focused on the task instead of drowning in prompt text.
+
+## Per-file sessions
+
+Every workbook document has its **own AI chat session**: History and the input draft are keyed by the
+document, so creating a new file or opening another file starts with an empty History, and switching
+back to an earlier file restores that file's conversation. The live workbook context (sheets, cells,
+formulas, selection) is rebuilt from the active document on every turn anyway, so the agent never
+carries another file's data as context.
+
+Switching files while a turn is running stops that turn and parks its history with the file it
+started on (the file gets a short "Task stopped because the active file changed." note); the new
+file's session never receives another file's messages. Closing a document forgets its session.
+
+Backend configuration — provider, API key, CLI agent/model, Ollama URL and connection status — stays
+global and is configured once, not per file. Only the conversation/context is per file; if you need
+per-file backends as well, that would be a separate change.
+
 ## Creating data from an empty sheet
 
 The engine and the agent both support starting from scratch. A validated recipe the prompt teaches:

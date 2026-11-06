@@ -384,6 +384,13 @@ pub enum WorkerEvent {
     Finished,
 }
 
+/// One file's AI chat session: its History and the input draft, parked while another file is active.
+#[derive(Default)]
+struct ChatSession {
+    messages: Vec<ChatEntry>,
+    input: String,
+}
+
 /// State of the AI Agent panel.
 pub struct AiAgentState {
     /// Currently viewed configuration tab (`Api`, `Terminal`, `Ollama`).
@@ -461,6 +468,11 @@ pub struct AiAgentState {
     pub control_rx: Option<Receiver<ControlRequest>>,
     /// Local TCP control port if the desktop host started a control listener.
     pub control_port: Option<u16>,
+    /// Chat sessions per workbook document: each opened/created file keeps its own History and
+    /// input draft, so switching files never mixes conversations.
+    sessions: std::collections::HashMap<u64, ChatSession>,
+    /// Document whose session is currently loaded into `messages`/`chat_input`.
+    session_doc: Option<u64>,
     /// Snapshot of Table 1's style/formula/table blueprint before the turn starts so merged tables match Table 1!
     #[cfg(not(target_arch = "wasm32"))]
     table_blueprint: Option<TableStyleBlueprint>,
@@ -525,6 +537,8 @@ impl Default for AiAgentState {
             control_tx: Some(control_tx),
             control_rx: Some(control_rx),
             control_port: None,
+            sessions: std::collections::HashMap::new(),
+            session_doc: None,
             #[cfg(not(target_arch = "wasm32"))]
             table_blueprint: None,
         }
@@ -689,6 +703,41 @@ impl AiAgentState {
             self.messages.clear();
             self.notify_error("Task was cancelled by user.");
         }
+    }
+
+    /// Loads the AI session of workbook document `doc`: a new file starts with an empty History;
+    /// switching back to an earlier file restores that file's own conversation and input draft.
+    /// Backend connections and API configuration stay global (configured once).
+    ///
+    /// A running turn cannot be split across files: its history is parked with the file it started
+    /// on and the turn is stopped, so the new file never receives another file's messages.
+    pub fn use_document_session(&mut self, doc: u64) {
+        if self.session_doc == Some(doc) {
+            return;
+        }
+        let was_running = self.running;
+        if was_running {
+            self.cancel_flag.store(true, Ordering::SeqCst);
+            self.running = false;
+            self.worker_rx = None;
+        }
+        if let Some(previous) = self.session_doc.take() {
+            let mut session = ChatSession { messages: std::mem::take(&mut self.messages), input: std::mem::take(&mut self.chat_input) };
+            if was_running {
+                session.messages.push(ChatEntry::System("Task stopped because the active file changed.".into()));
+            }
+            self.sessions.insert(previous, session);
+        }
+        let session = self.sessions.remove(&doc).unwrap_or_default();
+        self.messages = session.messages;
+        self.chat_input = session.input;
+        self.session_doc = Some(doc);
+        self.error_notification = None;
+    }
+
+    /// Forgets the sessions of documents that are no longer open.
+    pub fn retain_document_sessions(&mut self, open: &[u64]) {
+        self.sessions.retain(|doc, _| open.contains(doc));
     }
 
     /// Stop active tasks and disconnect all backends when the AI Agent panel itself is closed.
@@ -6656,5 +6705,52 @@ mod tests {
         assert!(state.api_models.contains(&"deepseek-reasoner".to_string()));
         state.select_api_model("deepseek-reasoner");
         assert_eq!(state.model, "deepseek-reasoner");
+    }
+
+    #[test]
+    fn ai_chat_sessions_are_per_document() {
+        let mut state = AiAgentState::default();
+        state.use_document_session(11);
+        state.messages.push(ChatEntry::User("hello file one".into()));
+        state.chat_input = "draft one".into();
+        // Opening/creating another file starts a fresh History and input draft.
+        state.use_document_session(22);
+        assert!(state.messages.is_empty());
+        assert!(state.chat_input.is_empty());
+        state.messages.push(ChatEntry::Assistant("reply file two".into()));
+        // Switching back restores the earlier file's own conversation.
+        state.use_document_session(11);
+        assert_eq!(state.messages.len(), 1);
+        assert!(matches!(&state.messages[0], ChatEntry::User(text) if text == "hello file one"));
+        assert_eq!(state.chat_input, "draft one");
+        state.use_document_session(22);
+        assert!(matches!(&state.messages[0], ChatEntry::Assistant(text) if text == "reply file two"));
+    }
+
+    #[test]
+    fn switching_files_stops_a_running_turn_and_parks_its_history() {
+        let mut state = AiAgentState::default();
+        state.use_document_session(1);
+        state.messages.push(ChatEntry::User("task for file one".into()));
+        state.running = true;
+        state.use_document_session(2);
+        assert!(!state.running);
+        assert!(state.cancel_flag.load(Ordering::SeqCst));
+        assert!(state.messages.is_empty(), "the new file starts with no old messages");
+        state.use_document_session(1);
+        assert_eq!(state.messages.len(), 2);
+        assert!(matches!(state.messages.last(), Some(ChatEntry::System(text)) if text.contains("file changed")));
+    }
+
+    #[test]
+    fn closed_documents_drop_their_parked_sessions() {
+        let mut state = AiAgentState::default();
+        state.use_document_session(1);
+        state.messages.push(ChatEntry::User("one".into()));
+        state.use_document_session(2);
+        state.messages.push(ChatEntry::User("two".into()));
+        state.retain_document_sessions(&[2]);
+        state.use_document_session(1);
+        assert!(state.messages.is_empty(), "the closed file's session was forgotten");
     }
 }

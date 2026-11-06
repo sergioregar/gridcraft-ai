@@ -127,6 +127,15 @@ impl SheetApp {
         // issues the capture command (after every widget, so a command cannot be missed).
         control::drain_screenshots(self, ctx);
         control::poll(self, ctx);
+        // The AI Agent keeps one chat session per workbook: a new/open file starts its own History
+        // and switching back restores that file's conversation. A running turn is parked with the
+        // file it belongs to before the new file's session is loaded.
+        let active_doc = self.session.active().map(|document| document.uid);
+        let open_docs: Vec<u64> = self.session.documents().iter().map(|document| document.uid).collect();
+        if let Some(doc) = active_doc {
+            self.ai_agent.use_document_session(doc);
+        }
+        self.ai_agent.retain_document_sessions(&open_docs);
         // The AI Agent's own in-process control channel: it runs tools for the agent (any engine or
         // UI command) and polls backend workers.
         ai_agent::poll_app(self, ctx);
