@@ -388,6 +388,8 @@ pub enum WorkerEvent {
         language: String,
         result: Result<String, String>,
     },
+    /// Microphone devices reported by the speech helper, or a friendly error.
+    VoiceDevices(Result<Vec<String>, String>),
     Finished,
 }
 
@@ -469,10 +471,22 @@ pub struct AiAgentState {
     /// English toast notification forwarded to `SheetApp::toast`.
     pub pending_toast: Option<String>,
 
-    /// Voice input: true while Windows speech recognition is listening to the microphone.
+    /// Voice input: true while the microphone is recording (click the mic again to stop).
     pub voice_listening: bool,
+    /// True while the local Whisper model turns the recording into text.
+    pub voice_transcribing: bool,
+    /// Microphones Windows reports, and which one to record from (`None` = system default).
+    pub voice_devices: Vec<String>,
+    pub voice_device: Option<usize>,
+    pub voice_devices_loading: bool,
+    pub voice_devices_loaded: bool,
+    /// One-line voice status shown under the input box (recording/transcribing/added).
+    pub voice_status: Option<String>,
     voice_rx: Option<Receiver<WorkerEvent>>,
+    voice_devices_rx: Option<Receiver<WorkerEvent>>,
     voice_cancel: Arc<AtomicBool>,
+    /// File the recording loop watches: writing it stops the microphone and starts transcription.
+    voice_stop_file: Option<std::path::PathBuf>,
 
     /// Dedicated in-process control channel so background AI threads can execute MCP tools on `SheetApp`
     /// even when `--control` TCP server is also active.
@@ -547,8 +561,16 @@ impl Default for AiAgentState {
             error_notification: None,
             pending_toast: None,
             voice_listening: false,
+            voice_transcribing: false,
+            voice_devices: Vec::new(),
+            voice_device: None,
+            voice_devices_loading: false,
+            voice_devices_loaded: false,
+            voice_status: None,
             voice_rx: None,
+            voice_devices_rx: None,
             voice_cancel: Arc::new(AtomicBool::new(false)),
+            voice_stop_file: None,
             control_tx: Some(control_tx),
             control_rx: Some(control_rx),
             control_port: None,
@@ -720,32 +742,63 @@ impl AiAgentState {
         }
     }
 
-    /// Start voice input: Windows speech recognition listens to the default microphone for one
-    /// utterance. The transcript fills the chat input and is sent automatically when a backend is
-    /// connected. Indonesian is used when its Windows speech language is installed.
+    /// Start recording from the selected microphone. The second press of the mic button stops the
+    /// recording and the local Whisper model turns it into text; the text only fills the input box.
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::disallowed_methods)]
     pub fn start_voice_input(&mut self, ctx: egui::Context) {
-        if self.voice_listening {
+        if self.voice_listening || self.voice_transcribing {
             return;
         }
         self.error_notification = None;
+        self.voice_status = Some("Recording... click the mic again when you finish speaking.".into());
         self.voice_cancel = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&self.voice_cancel);
+        let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let wav_path = std::env::temp_dir().join(format!("gridcraft-voice-{id}.wav"));
+        let stop_path = std::env::temp_dir().join(format!("gridcraft-voice-{id}.stop"));
+        let _ = std::fs::remove_file(&stop_path);
+        self.voice_stop_file = Some(stop_path.clone());
+        let device = self.voice_device;
         let (tx, rx) = channel();
         self.voice_rx = Some(rx);
         self.voice_listening = true;
         let _ = std::thread::Builder::new().name("ai-voice".into()).spawn(move || {
-            let (language, result) = run_voice_recognition(&cancel);
+            let (language, result) = run_voice_recognition(&cancel, device, &wav_path, &stop_path);
+            let _ = std::fs::remove_file(&stop_path);
             let _ = tx.send(WorkerEvent::VoiceResult { language, result });
             ctx.request_repaint();
         });
     }
 
-    /// Stop listening to the microphone and discard the partial recognition.
+    /// Stop recording: the helper finishes the WAV and starts local Whisper transcription.
     pub fn stop_voice_input(&mut self) {
-        self.voice_cancel.store(true, Ordering::SeqCst);
+        if !self.voice_listening {
+            return;
+        }
+        if let Some(stop_file) = self.voice_stop_file.take() {
+            let _ = std::fs::write(&stop_file, b"stop");
+        }
         self.voice_listening = false;
-        self.voice_rx = None;
+        self.voice_transcribing = true;
+        self.voice_status = Some("Transcribing with the local multilingual Whisper model...".into());
+    }
+
+    /// Refresh the list of microphones Windows exposes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn refresh_voice_devices(&mut self, ctx: egui::Context) {
+        if self.voice_devices_loading {
+            return;
+        }
+        self.voice_devices_loading = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        self.voice_devices_rx = Some(rx);
+        let _ = std::thread::Builder::new().name("ai-voice-devices".into()).spawn(move || {
+            let result = run_voice_devices(&cancel);
+            let _ = tx.send(WorkerEvent::VoiceDevices(result));
+            ctx.request_repaint();
+        });
     }
 
     /// Loads the AI session of workbook document `doc`: a new file starts with an empty History;
@@ -761,7 +814,10 @@ impl AiAgentState {
         // A voice utterance belongs to the file it was started from: stop listening on a switch.
         self.voice_cancel.store(true, Ordering::SeqCst);
         self.voice_listening = false;
+        self.voice_transcribing = false;
         self.voice_rx = None;
+        self.voice_stop_file = None;
+        self.voice_status = None;
         let was_running = self.running;
         if was_running {
             self.cancel_flag.store(true, Ordering::SeqCst);
@@ -796,7 +852,11 @@ impl AiAgentState {
         self.ollama_verify_cancel.store(true, Ordering::SeqCst);
         self.running = false;
         self.voice_listening = false;
+        self.voice_transcribing = false;
         self.voice_rx = None;
+        self.voice_devices_rx = None;
+        self.voice_stop_file = None;
+        self.voice_status = None;
         self.cli_scanning_models = false;
         self.ollama_scanning = false;
         self.worker_rx = None;
@@ -815,9 +875,17 @@ impl AiAgentState {
     /// Poll background verification & chat worker events each frame.
     pub fn poll(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
-        for rx in [&self.api_verify_rx, &self.api_models_rx, &self.cli_verify_rx, &self.ollama_verify_rx, &self.worker_rx, &self.voice_rx]
-            .into_iter()
-            .flatten()
+        for rx in [
+            &self.api_verify_rx,
+            &self.api_models_rx,
+            &self.cli_verify_rx,
+            &self.ollama_verify_rx,
+            &self.worker_rx,
+            &self.voice_rx,
+            &self.voice_devices_rx,
+        ]
+        .into_iter()
+        .flatten()
         {
             while let Ok(ev) = rx.try_recv() {
                 events.push(ev);
@@ -975,22 +1043,35 @@ impl AiAgentState {
                 }
                 WorkerEvent::VoiceResult { language, result } => {
                     self.voice_listening = false;
+                    self.voice_transcribing = false;
                     self.voice_rx = None;
+                    self.voice_stop_file = None;
                     match result {
                         Ok(transcript) if !transcript.trim().is_empty() => {
-                            let transcript = transcript.trim().to_string();
-                            self.messages.push(ChatEntry::System(format!("Voice ({language}): {transcript}")));
-                            self.chat_input = transcript.clone();
+                            // Voice only fills the input box: the user reviews/edits, then presses
+                            // Send or Enter themselves. Nothing is submitted automatically.
+                            self.chat_input = merge_voice_transcript(&self.chat_input, &transcript);
+                            self.voice_status = Some(format!("Voice added to the input box ({language}). Review it, then press Send."));
                             self.error_notification = None;
-                            // Sending by voice: a connected backend runs the command right away; with
-                            // no backend the transcript waits in the input box to be reviewed.
-                            if self.any_connected() && !self.running {
-                                self.chat_input.clear();
-                                send_chat_prompt(self, transcript, ctx.clone());
-                            }
                         }
-                        Ok(_) => self.notify_error("Voice input: no speech was recognized. Try again and speak clearly.".to_string()),
+                        Ok(_) => {
+                            self.notify_error("Voice input: no speech was recognized. Try again, speak clearly, and pause when finished.".to_string())
+                        }
                         Err(error) => self.notify_error(format!("Voice input: {error}")),
+                    }
+                }
+                WorkerEvent::VoiceDevices(result) => {
+                    self.voice_devices_loading = false;
+                    self.voice_devices_loaded = true;
+                    self.voice_devices_rx = None;
+                    match result {
+                        Ok(devices) => {
+                            if self.voice_device.is_some_and(|index| index >= devices.len()) {
+                                self.voice_device = None;
+                            }
+                            self.voice_devices = devices;
+                        }
+                        Err(error) => self.notify_error(format!("Microphones: {error}")),
                     }
                 }
                 WorkerEvent::Finished => {
@@ -1549,18 +1630,21 @@ fn show_history(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens
         #[cfg(not(target_arch = "wasm32"))]
         {
             let listening = app.ai_agent.voice_listening;
+            let transcribing = app.ai_agent.voice_transcribing;
             let color = if listening { Color32::from_rgb(210, 50, 50) } else { t.text_dim };
             let (rect, resp) = ui.allocate_exact_size(vec2(mic_width, 46.0), egui::Sense::click());
-            if resp.hovered() {
+            if resp.hovered() && !transcribing {
                 ui.painter().rect_filled(rect, 4.0, t.menu_bg);
             }
             crate::icons::paint(ui.painter(), rect.shrink2(vec2(8.0, 10.0)), Icon::Mic, color);
             let resp = resp.on_hover_text(if listening {
-                "Stop voice input"
+                "Stop recording"
+            } else if transcribing {
+                "Transcribing with the local Whisper model..."
             } else {
-                "Voice input: speak in your installed Windows speech language (Indonesian when added)"
+                "Voice input: record one utterance; the text goes into the input box (local Whisper: English, Indonesian and more)"
             });
-            if resp.clicked() {
+            if resp.clicked() && !transcribing {
                 if listening {
                     app.ai_agent.stop_voice_input();
                 } else {
@@ -1579,16 +1663,70 @@ fn show_history(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens
         });
     });
 
-    if app.ai_agent.voice_listening {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Which microphone to record from; the list comes from the speech helper.
+        if !app.ai_agent.voice_devices_loaded && !app.ai_agent.voice_devices_loading {
+            app.ai_agent.refresh_voice_devices(ctx.clone());
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Mic:").small().color(t.text_dim));
+            let selected = app
+                .ai_agent
+                .voice_device
+                .and_then(|index| app.ai_agent.voice_devices.get(index).cloned())
+                .unwrap_or_else(|| "Default microphone".to_string());
+            let mut chosen: Option<Option<usize>> = None;
+            craft_ui::ComboBox::from_id_salt("ai_voice_device")
+                .selected_text(selected)
+                .width((ui.available_width() - 70.0).max(120.0))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(app.ai_agent.voice_device.is_none(), "Default microphone").clicked() {
+                        chosen = Some(None);
+                    }
+                    for (index, name) in app.ai_agent.voice_devices.iter().enumerate() {
+                        if ui.selectable_label(app.ai_agent.voice_device == Some(index), name).clicked() {
+                            chosen = Some(Some(index));
+                        }
+                    }
+                })
+                .response
+                .accessible_name("Microphone");
+            if let Some(device) = chosen {
+                app.ai_agent.voice_device = device;
+            }
+            if app.ai_agent.voice_devices_loading {
+                ui.spinner();
+            } else if ui.small_button("Refresh").clicked() {
+                app.ai_agent.voice_devices_loaded = false;
+                app.ai_agent.refresh_voice_devices(ctx.clone());
+            }
+        });
+    }
+
+    if app.ai_agent.voice_transcribing {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.add(
                 egui::Label::new(
-                    RichText::new("Listening... speak now, then pause (Windows speech recognition).").small().italics().color(t.text_dim),
+                    RichText::new("Transcribing with the local multilingual Whisper model... (first use downloads ~75 MB)")
+                        .small()
+                        .italics()
+                        .color(t.text_dim),
                 )
                 .wrap(),
             );
         });
+    } else if app.ai_agent.voice_listening {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add(
+                egui::Label::new(RichText::new("Recording... click the mic again when you finish speaking.").small().italics().color(t.text_dim))
+                    .wrap(),
+            );
+        });
+    } else if let Some(status) = &app.ai_agent.voice_status {
+        ui.add(egui::Label::new(RichText::new(status).small().italics().color(t.text_dim)).wrap());
     }
 
     if trigger_send {
@@ -6745,65 +6883,201 @@ fn run_process_cancellable_with_stdin(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-const VOICE_SCRIPT: &str = r#"param([string]$Preferred = "id-ID")
-$ErrorActionPreference = "Stop"
-try {
-    Add-Type -AssemblyName System.Speech
-    $recognizers = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
-    if ($recognizers.Count -eq 0) {
-        Write-Output "ERR=NO_RECOGNIZER"
-        exit 3
-    }
-    $chosen = $null
-    foreach ($r in $recognizers) {
-        if ($r.Culture.Name -eq $Preferred) { $chosen = $r; break }
-    }
-    if (-not $chosen) {
-        foreach ($r in $recognizers) {
-            if ($r.Culture.Name -like "id-*") { $chosen = $r; break }
-        }
-    }
-    if (-not $chosen) { $chosen = $recognizers[0] }
-    $engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine($chosen.Culture)
-    $engine.InitialSilenceTimeout = [TimeSpan]::FromSeconds(10)
-    $engine.BabbleTimeout = [TimeSpan]::FromSeconds(3)
-    $engine.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.2)
-    $engine.EndSilenceTimeoutAmbiguous = [TimeSpan]::FromSeconds(1.5)
-    $engine.SetInputToDefaultAudioDevice()
-    $dictation = New-Object System.Speech.Recognition.DictationGrammar
-    $engine.LoadGrammar($dictation)
-    Write-Output ("LANG=" + $chosen.Culture.Name)
-    $result = $engine.Recognize([TimeSpan]::FromSeconds(25))
-    if ($null -eq $result) {
-        Write-Output "ERR=NO_SPEECH"
-        exit 4
-    }
-    Write-Output ("TEXT=" + $result.Text)
-    exit 0
-} catch {
-    Write-Output ("ERR=" + $_.Exception.Message)
-    exit 5
-}"#;
+const VOICE_SCRIPT: &str = r#"import ctypes
+import os
+import sys
+import time
+import wave
+from ctypes import wintypes
 
-/// Runs one Windows speech-recognition utterance on the default microphone (background thread).
-/// Returns the recognizer language (e.g. `id-ID`) and the transcript or a friendly error.
+winmm = ctypes.WinDLL("winmm")
+WAVE_MAPPER = -1
+WAVE_FORMAT_PCM = 1
+CALLBACK_NULL = 0
+
+
+class WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [
+        ("wFormatTag", wintypes.WORD),
+        ("nChannels", wintypes.WORD),
+        ("nSamplesPerSec", wintypes.DWORD),
+        ("nAvgBytesPerSec", wintypes.DWORD),
+        ("nBlockAlign", wintypes.WORD),
+        ("wBitsPerSample", wintypes.WORD),
+        ("cbSize", wintypes.WORD),
+    ]
+
+
+class WAVEHDR(ctypes.Structure):
+    _fields_ = [
+        ("lpData", ctypes.c_char_p),
+        ("dwBufferLength", wintypes.DWORD),
+        ("dwBytesRecorded", wintypes.DWORD),
+        ("dwUser", ctypes.c_void_p),
+        ("dwFlags", wintypes.DWORD),
+        ("dwLoops", wintypes.DWORD),
+        ("lpNext", ctypes.c_void_p),
+        ("reserved", ctypes.c_void_p),
+    ]
+
+
+class WAVEINCAPSW(ctypes.Structure):
+    _fields_ = [
+        ("wMid", wintypes.WORD),
+        ("wPid", wintypes.WORD),
+        ("vDriverVersion", wintypes.DWORD),
+        ("szPname", wintypes.WCHAR * 32),
+        ("dwFormats", wintypes.DWORD),
+        ("wChannels", wintypes.WORD),
+        ("wReserved1", wintypes.WORD),
+    ]
+
+
+def list_devices():
+    for index in range(winmm.waveInGetNumDevs()):
+        caps = WAVEINCAPSW()
+        winmm.waveInGetDevCapsW(index, ctypes.byref(caps), ctypes.sizeof(caps))
+        print("DEVICE=%d|%s" % (index, caps.szPname))
+
+
+def record(wav_path, stop_path, device_index, max_seconds=30):
+    fmt = WAVEFORMATEX(WAVE_FORMAT_PCM, 1, 16000, 32000, 2, 16, 0)
+    handle = ctypes.c_void_p()
+    device = WAVE_MAPPER if device_index is None or device_index < 0 else device_index
+    result = winmm.waveInOpen(ctypes.byref(handle), device, ctypes.byref(fmt), 0, 0, CALLBACK_NULL)
+    if result != 0:
+        print("ERR=Could not open microphone (waveInOpen code %d)." % result)
+        return False
+    buffer_size = 16000 * 2 * max_seconds
+    buffer = ctypes.create_string_buffer(buffer_size)
+    header = WAVEHDR(ctypes.cast(buffer, ctypes.c_char_p), buffer_size, 0, None, 0, 0, None, None)
+    winmm.waveInPrepareHeader(handle, ctypes.byref(header), ctypes.sizeof(header))
+    winmm.waveInAddBuffer(handle, ctypes.byref(header), ctypes.sizeof(header))
+    if winmm.waveInStart(handle) != 0:
+        winmm.waveInClose(handle)
+        print("ERR=Could not start recording.")
+        return False
+    started = time.time()
+    while time.time() - started < max_seconds:
+        if stop_path and os.path.exists(stop_path):
+            break
+        time.sleep(0.05)
+    winmm.waveInStop(handle)
+    winmm.waveInReset(handle)
+    data = buffer.raw[: header.dwBytesRecorded]
+    if len(data) < 3200:
+        print("ERR=No audio was recorded. Check the selected microphone.")
+        return False
+    with wave.open(wav_path, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(16000)
+        target.writeframes(data)
+    print("WAV=%s" % wav_path)
+    return True
+
+
+def transcribe(wav_path):
+    try:
+        import numpy as np
+        from faster_whisper import WhisperModel
+    except Exception:
+        print("ERR=Speech engine not installed. Run `pip install faster-whisper` where Python is installed, then try again.")
+        return
+    with wave.open(wav_path, "rb") as source:
+        frames = source.readframes(source.getnframes())
+        rate = source.getframerate()
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    model_name = os.environ.get("GRIDCRAFT_WHISPER_MODEL", "tiny")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    segments, info = model.transcribe(audio, beam_size=1, vad_filter=True)
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+    print("LANG=%s" % info.language)
+    print("TEXT=%s" % text)
+
+
+def main():
+    args = sys.argv[1:]
+    if "--list-devices" in args:
+        list_devices()
+        return
+    if "--record" not in args:
+        print("ERR=missing --record")
+        return
+    wav_path = args[args.index("--record") + 1]
+    stop_path = None
+    if "--stop" in args:
+        stop_path = args[args.index("--stop") + 1]
+    device_index = None
+    if "--device" in args:
+        try:
+            device_index = int(args[args.index("--device") + 1])
+        except ValueError:
+            device_index = None
+    if not record(wav_path, stop_path, device_index):
+        return
+    try:
+        transcribe(wav_path)
+    except Exception as error:
+        print("ERR=Speech recognition failed: %s" % error)
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+
+
+main()
+"#;
+
+/// Lists the microphone devices Windows exposes (background thread).
 #[cfg(not(target_arch = "wasm32"))]
-fn run_voice_recognition(cancel: &AtomicBool) -> (String, Result<String, String>) {
-    let script_path = std::env::temp_dir().join("gridcraft-voice.ps1");
-    if std::fs::write(&script_path, VOICE_SCRIPT).is_err() {
-        return ("unknown".into(), Err("Could not write the Windows speech helper script.".into()));
+fn run_voice_devices(cancel: &AtomicBool) -> Result<Vec<String>, String> {
+    let output = run_voice_script(&["--list-devices".to_string()], cancel, "Microphone list")?;
+    parse_voice_devices(&output)
+}
+
+/// Records one utterance (until the stop flag file appears or 30 seconds pass) and transcribes it
+/// with the local multilingual Whisper model. Returns the detected language and transcript.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_voice_recognition(
+    cancel: &AtomicBool,
+    device: Option<usize>,
+    wav_path: &std::path::Path,
+    stop_path: &std::path::Path,
+) -> (String, Result<String, String>) {
+    let mut args =
+        vec!["--record".to_string(), wav_path.to_string_lossy().to_string(), "--stop".to_string(), stop_path.to_string_lossy().to_string()];
+    if let Some(device) = device {
+        args.push("--device".to_string());
+        args.push(device.to_string());
     }
-    let script = script_path.to_string_lossy().to_string();
-    let args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script.as_str()];
-    let result = run_process_cancellable_with_stdin("powershell", &args, None, None, cancel, true, 90);
-    let _ = std::fs::remove_file(&script_path);
-    match result {
+    match run_voice_script(&args, cancel, "Voice input") {
         Ok(output) => parse_voice_output(&output),
         Err(error) => ("unknown".into(), Err(voice_error_hint(&error))),
     }
 }
 
-/// Parse the helper script's stdout (`LANG=`, `TEXT=`, `ERR=` lines) into a transcript.
+/// Writes the helper script and runs it with the system Python, returning its stdout.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::disallowed_methods)]
+fn run_voice_script(args: &[String], cancel: &AtomicBool, context: &str) -> Result<String, String> {
+    let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let script_path = std::env::temp_dir().join(format!("gridcraft-voice-{id}.py"));
+    std::fs::write(&script_path, VOICE_SCRIPT).map_err(|e| format!("{context}: cannot write the speech helper: {e}"))?;
+    let script = script_path.to_string_lossy().to_string();
+    let mut full_args: Vec<String> = vec![script];
+    full_args.extend(args.iter().cloned());
+    let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
+    let result = run_process_cancellable_with_stdin("python", &arg_refs, None, None, cancel, true, 900);
+    let _ = std::fs::remove_file(&script_path);
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => Err(format!("{context}: {error}")),
+    }
+}
+
+/// Parse the helper's stdout (`LANG=`, `TEXT=`, `ERR=` lines) into a transcript.
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_voice_output(output: &str) -> (String, Result<String, String>) {
     let mut language = String::from("unknown");
@@ -6830,19 +7104,57 @@ fn parse_voice_output(output: &str) -> (String, Result<String, String>) {
     }
 }
 
-/// User-facing guidance for the two common Windows speech failures.
+/// Parse the helper's `DEVICE=<index>|<name>` lines into device names.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_voice_devices(output: &str) -> Result<Vec<String>, String> {
+    let mut devices = Vec::new();
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("DEVICE=") {
+            let name = rest.split_once('|').map(|(_, name)| name.trim()).unwrap_or(rest.trim());
+            if !name.is_empty() {
+                devices.push(name.to_string());
+            }
+        }
+    }
+    if devices.is_empty() {
+        return Err("No microphone was found. Connect one and press Refresh.".into());
+    }
+    Ok(devices)
+}
+
+/// Appends a voice transcript to whatever the user already typed; it never sends the message.
+fn merge_voice_transcript(current: &str, transcript: &str) -> String {
+    let transcript = transcript.trim();
+    if transcript.is_empty() {
+        return current.to_string();
+    }
+    if current.trim().is_empty() {
+        return transcript.to_string();
+    }
+    let mut merged = current.trim_end().to_string();
+    merged.push(' ');
+    merged.push_str(transcript);
+    merged
+}
+
+/// User-facing guidance for the common speech-engine failures.
 #[cfg(not(target_arch = "wasm32"))]
 fn voice_error_hint(message: &str) -> String {
     let low = message.to_ascii_lowercase();
-    if low.contains("no_recognizer") || low.contains("no recognizer") {
-        return "Windows speech recognition is not installed for any language. Add a speech language in Windows \
-                Settings > Time & Language > Speech (for Indonesian, add Indonesian with speech), then try again."
+    if low.contains("no module named 'faster_whisper'") || low.contains("speech engine not installed") {
+        return "The local Whisper speech engine is not installed. Run `pip install faster-whisper` in the Python environment, then try again."
             .into();
     }
-    if low.contains("no microphone") || low.contains("no audio") || low.contains("audio device") {
-        return "No microphone was found. Connect a microphone and allow Windows to use it, then try again.".into();
+    if low.contains("failed to launch `python`") || low.contains("cannot find the file") && low.contains("python") {
+        return "Python was not found. Install Python (with faster-whisper) or put it on PATH, then try again.".into();
     }
-    format!("Windows speech recognition failed: {message}")
+    if low.contains("no microphone") {
+        return "No microphone was found. Connect a microphone, choose it in the Mic list, and try again.".into();
+    }
+    if low.contains("no speech") || low.contains("no audio") {
+        return "No speech was recognized. Try again, speak clearly, and pause when finished.".into();
+    }
+    format!("Voice input failed: {message}")
 }
 
 #[cfg(test)]
@@ -6965,18 +7277,36 @@ mod tests {
     }
     #[test]
     fn voice_script_output_parses_language_and_transcript() {
-        let (language, result) = parse_voice_output("LANG=id-ID\nTEXT=buat laporan penjualan");
-        assert_eq!(language, "id-ID");
+        let (language, result) = parse_voice_output("LANG=id\nTEXT=buat laporan penjualan");
+        assert_eq!(language, "id");
         assert!(matches!(result, Ok(text) if text == "buat laporan penjualan"));
 
-        let (_, no_recognizer) = parse_voice_output("LANG=en-US\nERR=NO_RECOGNIZER");
-        let message = match no_recognizer {
+        let (_, missing_engine) = parse_voice_output("ERR=Speech engine not installed. Run `pip install faster-whisper`");
+        let message = match missing_engine {
             Err(message) => message,
             Ok(_) => String::new(),
         };
-        assert!(message.contains("speech language"), "unexpected hint: {message}");
+        assert!(message.contains("pip install faster-whisper"), "unexpected hint: {message}");
 
-        let (_, no_speech) = parse_voice_output("LANG=en-US\nERR=NO_SPEECH");
+        let (_, no_speech) = parse_voice_output("LANG=en\nERR=No speech was recognized");
         assert!(no_speech.is_err());
+    }
+
+    #[test]
+    fn microphone_list_parses_device_names() {
+        let devices = match parse_voice_devices("DEVICE=0|Microphone (Realtek(R) Audio\nDEVICE=1|USB Microphone") {
+            Ok(devices) => devices,
+            Err(error) => panic!("device list failed: {error}"),
+        };
+        assert_eq!(devices, vec!["Microphone (Realtek(R) Audio".to_string(), "USB Microphone".to_string()]);
+        assert!(parse_voice_devices("").is_err());
+    }
+
+    #[test]
+    fn voice_transcript_appends_to_the_input_without_sending() {
+        // Voice only fills the textbox: this helper never sends anything.
+        assert_eq!(merge_voice_transcript("", "  buat laporan  "), "buat laporan");
+        assert_eq!(merge_voice_transcript("buat", "laporan penjualan"), "buat laporan penjualan");
+        assert_eq!(merge_voice_transcript("draft  ", "tambahkan total"), "draft tambahkan total");
     }
 }

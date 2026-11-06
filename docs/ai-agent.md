@@ -64,24 +64,24 @@ per-file backends as well, that would be a separate change.
 
 ## Voice input
 
-A microphone button sits between the chat input and **Send**. Press it and speak one utterance; the
-button shows a **Listening...** indicator while Windows speech recognition listens, then pauses when
-you stop talking. The transcript is written into the chat input and, when a backend is connected, the
-command is sent automatically (the History shows `Voice (<language>): <transcript>`). Press the
-microphone again to cancel while it is listening.
+A microphone button sits between the chat input and **Send**, and a **Mic** selector below the box
+chooses which recording device to use (with **Refresh** to re-scan the devices). Press the mic, speak
+one utterance, then press it again; the local speech model transcribes the recording and writes the
+text into the input box. **Nothing is sent automatically** — review or edit the text and press
+**Send**/Enter yourself. A second voice recording appends to whatever is already typed.
 
-Recognition uses the **Windows Speech Recognition** engine (`System.Speech`), so it works offline and
-with the speech languages installed in Windows. It prefers **Indonesian** (`id-ID`) when that speech
-language is installed, then falls back to the first installed recognizer. To add Indonesian:
+Transcription uses the local, lightweight **multilingual Whisper** model (`tiny`, run through
+`faster-whisper` on the CPU): it works offline, detects the spoken language automatically (English,
+Indonesian and many others) and audio never leaves the machine. The first use downloads the model
+(~75 MB) once; a recording is transcribed in about a second on a laptop CPU. Set
+`GRIDCRAFT_WHISPER_MODEL` (e.g. `base` or `small`) for a larger, more accurate model.
 
-1. Windows Settings → **Time & Language → Language & region**.
-2. Add **Indonesian**, then under its **Language features** install **Speech** (the speech
-   recognition pack). A restart of the AI pane is not needed; the next microphone press uses it.
-3. The microphone tooltip and the History's `Voice (...)` line show which language was used.
+Requirements on the desktop: Python on `PATH` with `faster-whisper` installed
+(`pip install faster-whisper`). If Python or the package is missing, the pane shows a one-line error
+with the exact command; microphone failures (unplugged device, wrong input) are reported there too.
+Voice input is desktop-only (not in the web build).
 
-Without any installed speech language the pane shows a one-line error explaining how to add one.
-Voice input is available in the desktop app only (not the web build), and it never sends audio to
-GridCraft servers — recognition is local to Windows.
+## Creating data from an empty sheet
 
 ## Creating data from an empty sheet
 
