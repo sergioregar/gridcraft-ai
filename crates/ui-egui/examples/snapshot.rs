@@ -22,6 +22,8 @@ fn main() {
     let mut dialog: Option<String> = None;
     let mut language: Option<String> = None;
     let mut hf_edit: Option<String> = None;
+    let mut ai_provider: Option<String> = None;
+    let mut ai_model: Option<String> = None;
     let mut out = "snapshot.png".to_string();
     let mut i = 0;
     while i < args.len() {
@@ -75,6 +77,14 @@ fn main() {
                 i += 1;
                 language = args.get(i).cloned();
             }
+            "--ai-provider" => {
+                i += 1;
+                ai_provider = args.get(i).cloned();
+            }
+            "--ai-model" => {
+                i += 1;
+                ai_model = args.get(i).cloned();
+            }
             other => out = other.to_string(),
         }
         i += 1;
@@ -115,6 +125,18 @@ fn main() {
                     app.ui.ribbon_tab = t;
                 }
                 app.grid.pane = pane;
+                if ai_provider.is_some() || ai_model.is_some() {
+                    let mut params = json!({"on": true});
+                    if let Some(p) = &ai_provider {
+                        params["provider"] = json!(p);
+                    }
+                    if let Some(m) = &ai_model {
+                        params["model"] = json!(m);
+                    }
+                    if let Err(e) = app.run("ui.aiAgent", params) {
+                        eprintln!("ui.aiAgent: {e}");
+                    }
+                }
                 app.selected_chart = chart;
                 if let Some(d) = &dialog {
                     let (name, p) =

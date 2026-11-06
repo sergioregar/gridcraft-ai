@@ -182,6 +182,14 @@ The MCP server offers tools such as `read_range`, `write_range`, `set_cell`, `ev
 pointer and keyboard input, dialogs and screenshots. See [`docs/mcp.md`](docs/mcp.md),
 [`docs/cli.md`](docs/cli.md) and [`docs/control-protocol.md`](docs/control-protocol.md).
 
+The desktop app also has a built-in **AI Agent** pane (title bar › AI Agent, or Automate › AI Agent):
+connect a cloud LLM API key, a Terminal CLI agent (`agy`, `claude`, `codex`) or a local Ollama
+model, pick the model, then ask for spreadsheet work in natural language. All three backends share
+one tool layer that can discover and run **every** GridCraft command (`list_commands`,
+`describe_command`, `execute_command`, `execute_commands`), list worksheet functions, and reach
+UI-only actions, so the agent is not limited to a handful of canned tools. See
+[`docs/ai-agent.md`](docs/ai-agent.md).
+
 ## Architecture
 
 GridCraft is an engine-first Cargo workspace with enforced layering (`cargo xtask layers`). The

@@ -1008,11 +1008,12 @@ impl Dialog {
                 app.run_or_alert("review.showComments", json!({"on": true}));
                 return None;
             }
-            "watch" | "selectionPane" | "formatChart" => {
+            "watch" | "selectionPane" | "formatChart" | "aiAgent" => {
                 app.grid.pane = Some(
                     match name {
                         "watch" => "watch",
                         "selectionPane" => "selection",
+                        "aiAgent" => "aiAgent",
                         _ => "formatChart",
                     }
                     .into(),

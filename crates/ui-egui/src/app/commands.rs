@@ -137,6 +137,38 @@ impl SheetApp {
                 self.ui.ribbon_tab = p.get("tab").and_then(Json::as_str).unwrap_or("Home").to_string();
                 Ok(Json::Null)
             }
+            "ui.aiAgent" => {
+                let open = p.get("on").and_then(Json::as_bool).unwrap_or(self.grid.pane.as_deref() != Some("aiAgent"));
+                if open {
+                    self.grid.pane = Some("aiAgent".into());
+                    // Agents can preselect the provider/model (never the API key: it is not a
+                    // command parameter and must not reach the journal or the shared workbook state).
+                    if let Some(provider) = p.get("provider").and_then(Json::as_str)
+                        && let Some(api_provider) = crate::ai_agent::ApiProvider::from_str_name(provider)
+                    {
+                        self.ai_agent.set_provider(api_provider);
+                    }
+                    if let Some(model) = p.get("model").and_then(Json::as_str) {
+                        self.ai_agent.select_api_model(model);
+                    }
+                    if let Some(url) = p.get("baseUrl").and_then(Json::as_str)
+                        && !url.trim().is_empty()
+                    {
+                        self.ai_agent.base_url = url.trim().to_string();
+                    }
+                    if let Some(url) = p.get("ollamaUrl").and_then(Json::as_str)
+                        && !url.trim().is_empty()
+                    {
+                        self.ai_agent.ollama_url = url.trim().to_string();
+                    }
+                } else {
+                    self.ai_agent.stop_and_disconnect(None);
+                    if self.grid.pane.as_deref() == Some("aiAgent") {
+                        self.grid.pane = None;
+                    }
+                }
+                Ok(json!({"on": open, "provider": self.ai_agent.provider.label(), "model": self.ai_agent.model}))
+            }
             "view.collapseRibbon" => {
                 self.ui.ribbon_collapsed = !self.ui.ribbon_collapsed;
                 Ok(Json::Null)

@@ -18,8 +18,9 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
     let Some(pane) = app.grid.pane.clone().or_else(|| app.session.comments_pane.then(|| "comments".to_string())) else { return };
     let t = Tokens::get(ui.ctx());
     // Capped at half the window so a pane can never cover the sheet, whatever its content asks for.
-    let max = (ui.available_width() / 2.0).max(300.0);
-    let panel = egui::Panel::right("task_pane").default_size(300.0).max_size(max).resizable(true);
+    let max = (ui.available_width() / 2.0).max(340.0);
+    let default_width = if pane == "aiAgent" { 380.0 } else { 300.0 };
+    let panel = egui::Panel::right("task_pane").default_size(default_width).max_size(max).resizable(true);
     panel.frame(egui::Frame::NONE.fill(t.ribbon).inner_margin(10)).show(ui, |ui| {
         ui.horizontal(|ui| {
             let title = match pane.as_str() {
@@ -27,6 +28,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                 "watch" => "Watch Window",
                 "selection" => "Selection",
                 "formatChart" => "Format Chart Area",
+                "aiAgent" => "AI Agent",
                 _ => "",
             };
             ui.label(egui::RichText::new(title).font(theme::ui_bold(15.0)));
@@ -35,18 +37,26 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                     if pane == "comments" {
                         app.run_or_alert("review.showComments", json!({"on": false}));
                     }
+                    if pane == "aiAgent" {
+                        app.ai_agent.stop_and_disconnect(None);
+                    }
                     app.grid.pane = None;
                 }
             });
         });
         ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| match pane.as_str() {
-            "comments" => comments(app, ui),
-            "watch" => watch(app, ui),
-            "selection" => selection(app, ui),
-            "formatChart" => format_chart(app, ui),
-            _ => {}
-        });
+        if pane == "aiAgent" {
+            let ctx = ui.ctx().clone();
+            crate::ai_agent::show(app, ui, &ctx);
+        } else {
+            egui::ScrollArea::vertical().show(ui, |ui| match pane.as_str() {
+                "comments" => comments(app, ui),
+                "watch" => watch(app, ui),
+                "selection" => selection(app, ui),
+                "formatChart" => format_chart(app, ui),
+                _ => {}
+            });
+        }
     });
 }
 

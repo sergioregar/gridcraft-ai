@@ -1,0 +1,76 @@
+# AI Agent
+
+GridCraft's built-in AI Agent drives the live workbook from the **AI Agent** pane (the button in the
+title bar and Automate › AI Agent). It has three backends, and each is configured in its own tab:
+
+| Tab | Backend | How it connects |
+|---|---|---|
+| ☁ LLM API Key | OpenRouter, AgentRouter, OpenAI, Anthropic, Gemini, DeepSeek, Groq, or a custom OpenAI-compatible endpoint | Enter an API key, pick a model (dropdown or typed by hand), then Connect. |
+| 🖳 Terminal Agent | `agy`, `claude`, `codex`, or a custom CLI | The agent runs the CLI once per turn and reads `<gridcraft_tool>` tags from its reply. |
+| 🦙 Local (Ollama) | A local Ollama server (`http://127.0.0.1:11434` by default) | Uses Ollama's OpenAI-compatible endpoint, with the same tool set as the API tab. |
+
+Switching tabs never disconnects a running backend; the chat panel works whenever at least one
+backend is connected.
+
+## Choosing a model (LLM API tab)
+
+The **Model** dropdown starts with the provider's built-in candidates and is replaced by the exact
+list the key can use after the first `GET {base_url}/models` call (the 🔄 button reloads it at any
+time; Connect also fills it). The **Model manual** field accepts any id the provider does not list
+(a preview model, a self-hosted name, an alias). The chosen id is sent as `model` on every chat
+request, and `Connect` verifies that model first, then falls back to the account's other models and
+the built-in candidates.
+
+DeepSeek, for example, lists `deepseek-chat` and `deepseek-reasoner`; the dropdown shows whatever
+the key actually returns, and typing `deepseek-reasoner` works even before a list is loaded.
+
+```json
+{"command": "ui.aiAgent", "params": {"provider": "DeepSeek", "model": "deepseek-chat"}}
+```
+Agents can preselect the provider and model over the control channel (the API key is never a
+command parameter and never reaches the journal).
+
+## Full feature access
+
+Every GridCraft feature is a command (see [`architecture.md`](architecture.md) and
+[`control-protocol.md`](control-protocol.md)), so the agent is not restricted to a fixed set of
+actions. With **Akses penuh** enabled (the default) it can:
+
+- discover the whole surface — `list_commands` searches all engine and UI commands by id, label,
+  ribbon path and params; `describe_command` returns one command's full documentation;
+  `list_functions` searches the 514 worksheet functions;
+- run any command — `execute_command` (single) and `execute_commands` (batch, with per-command
+  results). Short names work: `bold` → `home.bold`, `sortDescending` → `data.sortDescending`,
+  `Format Cells` → `home.formatCells`. Unknown ids come back with the nearest candidates instead of
+  a bare "unknown command";
+- reach UI-only actions — `ui_control` covers ribbon/view state, interface language, read-only
+  workbook queries and opening dialogs for inspection. Pointer/keyboard injection, printing,
+  quitting the app and a dialog's OK button stay out of reach on purpose: commands express those
+  intents with explicit parameters, where the agent has to say what it wants.
+- build multi-step work — `select`, `sort_range`, `undo`/`redo`, and the chart/table helpers mirror
+  the MCP server's tools ([`mcp.md`](mcp.md)); anything else is one `execute_command` away.
+
+The live command catalog is also embedded in the prompt (switch **Katalog command di prompt**) so a
+model knows a feature exists without spending a tool round trip. Terminal CLI agents get the same
+catalog and recipes inline, because they cannot call back into GridCraft mid-turn; if every tool in
+an attempt fails they get one more attempt with the errors in the prompt.
+
+## What the agent can rely on
+
+- The live grid/table context (sheets, tables, column roles, cell values) is captured when a turn
+  starts; the agent is told to re-read after structural edits.
+- Commands act on the active sheet and selection, so the prompt requires explicit `range`/`sheet`
+  parameters.
+- Commands that open a dialog when a required parameter is missing have no effect in the agent's
+  headless control path; the prompt requires complete parameters and the agent can call the
+  command's primitive form instead (for example `home.formatCells {range, style}` rather than
+  opening Format Cells).
+- With full access on, the agent runs exactly the command it asked for: the legacy auto-wipe and
+  chart-substitution heuristics are off. A malformed `ai.deep_clear` range is reported as an error
+  instead of clearing the whole sheet.
+
+## Privacy
+
+The pane only talks to the backend the user configures. There is no telemetry; local Ollama keeps
+the prompt on the machine. The API key lives in the session's memory (`AiAgentState`), not in
+`ui.json`/`prefs.json`.

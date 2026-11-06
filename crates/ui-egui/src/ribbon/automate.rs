@@ -2,6 +2,10 @@ use super::controls::control_keytip;
 use super::{Icon, SheetApp, Ui, big_button, json};
 
 pub(super) fn automate(app: &mut SheetApp, ui: &mut Ui) {
+    let __k = big_button(ui, Icon::Script, "AI\nAgent", "Chat with an LLM (API key), a Terminal CLI agent or a local Ollama model", false);
+    if __k.clicked() {
+        let _ = app.run("ui.aiAgent", json!({"on": true}));
+    }
     if big_button(ui, Icon::Script, "Macros", "Macros and scripts in this workbook (Alt+F8)", false).clicked() {
         app.open_dialog("macros", json!({}));
     }

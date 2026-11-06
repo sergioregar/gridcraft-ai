@@ -144,6 +144,10 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                 if __k.clicked() {
                     app.open_dialog("comments", json!({}));
                 }
+                let ai = icon_button(ui, Icon::Script, t.text_dim, "AI Agent", vec2(28.0, ch));
+                if ai.clicked() {
+                    let _ = app.run("ui.aiAgent", json!({}));
+                }
                 // Quick light/dark switch (#194); right-click offers System as well. The same
                 // choice lives in File › Display theme and the View tab.
                 let lang = app.ui.language;

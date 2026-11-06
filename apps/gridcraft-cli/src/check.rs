@@ -292,6 +292,12 @@ fn walk(dir: &Path, depth: usize, out: &mut Discovery, seen: &mut std::collectio
             return true;
         }
     }
+    #[cfg(not(unix))]
+    {
+        // Without a directory identity the set stays empty; the depth cap bounds the walk, but the
+        // argument is still threaded through the recursion for the unix build's benefit.
+        let _ = seen.len();
+    }
     if depth > MAX_DEPTH {
         out.fail(dir, format!("directory depth limit of {MAX_DEPTH} exceeded; this subtree was not checked"));
         return true;

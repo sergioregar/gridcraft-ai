@@ -131,6 +131,11 @@ Actions made of many commands (macros, a debugger that runs one step per call) u
   (`engine.execute`, `ui.screenshot`, pointer and keyboard input…), see
   [`control-protocol.md`](control-protocol.md).
 - MCP: `gridcraft-cli mcp`, headless or `--connect` to a running app, see [`mcp.md`](mcp.md).
+- Built-in AI Agent pane: `crates/ui-egui/src/ai_agent.rs` (chat, backends, prompts) with
+  `crates/ui-egui/src/ai_tools.rs` (command catalog, id resolution, tool schema, prompt recipes).
+  Cloud API keys, Terminal CLI agents and local Ollama all reach every engine/UI command through
+  the app's own control channel, so agents can use features as they land; see
+  [`ai-agent.md`](ai-agent.md).
 - CLI: [`cli.md`](cli.md).
 
 ## Platforms and builds
@@ -150,6 +155,7 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | Built-in AI Agent ported onto 0.13: panes/ribbon wiring, `ai_tools.rs` catalog + tool schema, model picker, upstream feature recipes |
 | 2026-10-24 | minor | Engine building blocks for multi-command actions: undo groups, recording buffer, document trust, chunked hidden-name storage |
 | 2026-10-14 | minor | Document Undo's retained-cell-storage budget and latest-step guarantee |
 | 2026-10-10 | major | Created from the code on main: crates, layers, data flow, agent control, known gaps |

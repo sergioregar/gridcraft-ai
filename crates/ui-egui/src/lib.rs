@@ -6,6 +6,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod ai_agent;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+mod ai_tools;
 pub mod backstage;
 mod border_preview;
 mod cell_pictures;
@@ -217,6 +220,8 @@ pub struct SheetApp {
     /// without reaching input handling, so the hook must offer the same step again.
     pub(crate) synthetic_injected_at_pass: Option<u64>,
     pub control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
+    /// The built-in AI Agent: chat backends, full command access and the pane's state.
+    pub ai_agent: ai_agent::AiAgentState,
     pub grid: grid::GridState,
     pub perf: Perf,
     pub fonts_ready: bool,
