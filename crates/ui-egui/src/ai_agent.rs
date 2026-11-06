@@ -306,7 +306,7 @@ impl CliModelInfo {
     pub fn badge_label(&self) -> String {
         match &self.access {
             CliModelAccess::Usable => format!("OK {} ({})", self.display_name, self.id),
-            CliModelAccess::Unavailable(_) => format!("X {} ({}) [Tidak tersedia]", self.display_name, self.id),
+            CliModelAccess::Unavailable(_) => format!("X {} ({}) [Unavailable]", self.display_name, self.id),
             CliModelAccess::Unknown => format!("• {} ({})", self.display_name, self.id),
         }
     }
@@ -908,20 +908,26 @@ fn format_english_error(raw: &str) -> String {
 /// Render the AI Agent pane inside the right-hand task pane.
 pub fn show(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
+    // The pane is right-anchored: keep every row inside the available width so long text can never
+    // widen the panel (which used to slide its left edge over the grid).
+    ui.set_width(ui.available_width());
 
-    // --- Mode Tabs (Switching tabs NEVER disconnects existing connections!) ---
+    // Mode tabs. Switching tabs never disconnects a running backend.
     ui.horizontal_wrapped(|ui| {
-        for (m, icon) in [(AgentMode::Api, "LLM API Key"), (AgentMode::Terminal, "Terminal Agent"), (AgentMode::Ollama, "Local (Ollama)")] {
-            let selected = app.ai_agent.mode == m;
-            let connected = app.ai_agent.status_of(m).is_connected();
-            let label = if connected { format!("{icon} (aktif)") } else { icon.to_string() };
-            let text = if connected { RichText::new(label).color(Color32::from_rgb(31, 157, 85)).strong() } else { RichText::new(label) };
+        for (mode, label) in [(AgentMode::Api, "LLM API Key"), (AgentMode::Terminal, "Terminal Agent"), (AgentMode::Ollama, "Local (Ollama)")] {
+            let selected = app.ai_agent.mode == mode;
+            let connected = app.ai_agent.status_of(mode).is_connected();
+            let text = if connected {
+                RichText::new(format!("{label} (active)")).color(Color32::from_rgb(31, 157, 85)).strong()
+            } else {
+                RichText::new(label)
+            };
             if ui.selectable_label(selected, text).clicked() {
-                app.ai_agent.mode = m;
+                app.ai_agent.mode = mode;
                 if connected {
-                    app.ai_agent.active_chat_backend = m;
+                    app.ai_agent.active_chat_backend = mode;
                 }
-                if m == AgentMode::Ollama && !app.ai_agent.ollama_scanned && !app.ai_agent.ollama_scanning {
+                if mode == AgentMode::Ollama && !app.ai_agent.ollama_scanned && !app.ai_agent.ollama_scanning {
                     start_ollama_scan(&mut app.ai_agent, ctx.clone());
                 }
             }
@@ -929,12 +935,11 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context) {
     });
     ui.add_space(6.0);
 
-    // Auto-scan Ollama models the first time the Ollama tab is viewed.
+    // Auto-scan Ollama models the first time the Local tab is viewed.
     if app.ai_agent.mode == AgentMode::Ollama && !app.ai_agent.ollama_scanned && !app.ai_agent.ollama_scanning {
         start_ollama_scan(&mut app.ai_agent, ctx.clone());
     }
 
-    // --- Configuration Card for the Selected Tab ---
     let viewed_mode = app.ai_agent.mode;
     egui::Frame::NONE.fill(t.menu_bg).corner_radius(6.0).inner_margin(8.0).stroke(Stroke::new(1.0, t.separator)).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -946,17 +951,8 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context) {
     });
 
     ui.add_space(6.0);
-
-    // --- Full command-surface access: every GridCraft feature is a command the agent can find and
-    // --- run; these switches bound how much of that surface goes into the prompt and UI.
-    show_full_access(app, ui, &t);
-
-    ui.add_space(6.0);
-
-    // --- Connection Status Indicator for the Viewed Tab ---
     show_status_badge(app.ai_agent.status_of(viewed_mode), ui, &t);
 
-    // --- Prominent English Error Notification Banner ---
     if let Some(err_msg) = app.ai_agent.error_notification.clone() {
         ui.add_space(6.0);
         let mut dismiss = false;
@@ -965,93 +961,26 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context) {
         egui::Frame::NONE.fill(err_bg).corner_radius(6.0).inner_margin(8.0).stroke(Stroke::new(1.0, err_border)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Process Error").font(theme::ui_bold(12.5)).color(err_border));
+                ui.label(RichText::new("Error").font(theme::ui_bold(12.5)).color(err_border));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("x").on_hover_text("Dismiss notification").clicked() {
+                    if ui.small_button("x").on_hover_text("Dismiss").clicked() {
                         dismiss = true;
                     }
                 });
             });
-            ui.add_space(2.0);
-            ui.label(RichText::new(err_msg).font(theme::ui_font(12.0)).color(t.text));
+            ui.add(egui::Label::new(RichText::new(err_msg).font(theme::ui_font(12.0)).color(t.text)).wrap());
         });
         if dismiss {
             app.ai_agent.error_notification = None;
         }
     }
 
-    // --- Chat Panel (Stays open whenever ANY backend is connected!) ---
-    if app.ai_agent.any_connected() {
-        app.ai_agent.sync_active_backend();
-        ui.add_space(6.0);
-        ui.separator();
-        show_chat_panel(app, ui, ctx, &t);
-    }
+    ui.add_space(6.0);
+    ui.separator();
+    show_history(app, ui, ctx, &t);
 }
 
-/// Shared across the three mode tabs: states that the agent reaches the whole GridCraft command
-/// surface, and bounds it with three switches. An agent without full access keeps the original
-/// small tool set; the catalog and UI switches only matter while full access is on.
-fn show_full_access(app: &mut SheetApp, ui: &mut Ui, t: &Tokens) {
-    let command_count = app.session.commands().len();
-    let tool_count = crate::ai_tools::tool_names(app.ai_agent.full_tool_access, app.ai_agent.allow_ui_tools).len();
-    let ui_method_count = crate::ai_tools::UI_METHODS.len();
-    egui::Frame::NONE.fill(t.menu_bg).corner_radius(6.0).inner_margin(8.0).stroke(Stroke::new(1.0, t.separator)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Akses penuh").font(theme::ui_bold(12.5)).color(t.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut on = app.ai_agent.full_tool_access;
-                if ui
-                    .checkbox(&mut on, "Semua fitur")
-                    .on_hover_text("Beri AI akses ke seluruh 353 command GridCraft, bukan hanya tool dasar")
-                    .changed()
-                {
-                    app.ai_agent.full_tool_access = on;
-                }
-            });
-        });
-        ui.label(RichText::new(crate::ai_tools::full_access_summary(command_count, tool_count, ui_method_count)).small().color(t.text_dim));
-        if app.ai_agent.full_tool_access {
-            ui.horizontal_wrapped(|ui| {
-                let mut catalog = app.ai_agent.include_command_catalog;
-                if ui
-                    .checkbox(&mut catalog, "Katalog command di prompt")
-                    .on_hover_text("Model langsung tahu semua fitur tanpa memanggil list_commands dulu")
-                    .changed()
-                {
-                    app.ai_agent.include_command_catalog = catalog;
-                }
-                let mut ui_tools = app.ai_agent.allow_ui_tools;
-                if ui
-                    .checkbox(&mut ui_tools, "Tool UI/dialog")
-                    .on_hover_text("Izinkan ui_control: inspeksi UI, ganti tab ribbon/tema, bahasa antarmuka")
-                    .changed()
-                {
-                    app.ai_agent.allow_ui_tools = ui_tools;
-                }
-            });
-            ui.label(
-                RichText::new(
-                    "AI mencari id command lewat list_commands lalu menjalankan apa pun: sort, filter, pivot, chart, \
-                         conditional formatting, data validation, page setup, print/PDF, review, automate, what-if.",
-                )
-                .small()
-                .italics()
-                .color(t.text_dim),
-            );
-        } else {
-            ui.label(
-                RichText::new("Aktifkan untuk memberi AI seluruh permukaan fitur GridCraft; tanpa ini hanya tool dasar yang tersedia.")
-                    .small()
-                    .italics()
-                    .color(t.text_dim),
-            );
-        }
-    });
-}
-
-/// Cloud LLM API configuration: User only picks Provider and enters API Key (no manual model picker!).
+/// Cloud LLM API configuration: provider, API key, and the model to use.
 fn show_api_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens) {
     ui.horizontal(|ui| {
         ui.label("Provider:");
@@ -1060,9 +989,9 @@ fn show_api_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tok
             .selected_text(current.label())
             .width((ui.available_width() - 8.0).max(120.0))
             .show_ui(ui, |ui| {
-                for &p in ApiProvider::ALL {
-                    if ui.selectable_label(p == current, p.label()).clicked() {
-                        app.ai_agent.set_provider(p);
+                for &provider in ApiProvider::ALL {
+                    if ui.selectable_label(provider == current, provider.label()).clicked() {
+                        app.ai_agent.set_provider(provider);
                     }
                 }
             })
@@ -1087,32 +1016,30 @@ fn show_api_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tok
             if ui.small_button(toggle_label).clicked() {
                 app.ai_agent.show_api_key = !app.ai_agent.show_api_key;
             }
-            let r = ui.add(
+            let response = ui.add(
                 egui::TextEdit::singleline(&mut app.ai_agent.api_key)
                     .password(!show_key)
-                    .hint_text("Masukkan API Key (sk-…)")
+                    .hint_text("Enter API key (sk-...)")
                     .desired_width(ui.available_width()),
             );
-            if r.changed() && matches!(app.ai_agent.api_status, ConnStatus::Failed(_)) {
+            if response.changed() && matches!(app.ai_agent.api_status, ConnStatus::Failed(_)) {
                 app.ai_agent.api_status = ConnStatus::Disconnected;
             }
         });
     });
 
-    // Model picker: built-in candidates plus the provider's own `/models` list (Muat ulang), with a manual
-    // id field for providers that do not list models (or a model the account has on request).
     ui.horizontal(|ui| {
         ui.label("Model:");
-        let selected = if app.ai_agent.model.is_empty() { "(pilih model)".to_string() } else { app.ai_agent.model.clone() };
+        let selected = if app.ai_agent.model.is_empty() { "(choose a model)".to_string() } else { app.ai_agent.model.clone() };
         craft_ui::ComboBox::from_id_salt("ai_api_model_combo")
             .selected_text(selected)
             .width((ui.available_width() - 92.0).max(130.0))
             .show_ui(ui, |ui| {
-                let list = app.ai_agent.api_models.clone();
-                if list.is_empty() {
-                    ui.label(RichText::new("Belum ada daftar model — klik Muat ulang atau ketik id model di bawah.").small().color(t.text_dim));
+                let models = app.ai_agent.api_models.clone();
+                if models.is_empty() {
+                    ui.label(RichText::new("No models loaded yet - refresh or type an id below.").small().color(t.text_dim));
                 }
-                for model in list {
+                for model in models {
                     let is_selected = app.ai_agent.model == model;
                     if ui.selectable_label(is_selected, model.as_str()).clicked() {
                         app.ai_agent.select_api_model(model);
@@ -1122,37 +1049,38 @@ fn show_api_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tok
             .response
             .accessible_name("Model");
         let scanning = app.ai_agent.api_models_scanning;
-        let label = if scanning { "Memuat..." } else { "Muat ulang" };
-        if ui
-            .add_enabled(!scanning, egui::Button::new(label))
-            .on_hover_text("Muat daftar model yang bisa dipakai API Key ini (GET /models)")
-            .clicked()
-        {
+        let label = if scanning { "Loading..." } else { "Refresh" };
+        if ui.add_enabled(!scanning, egui::Button::new(label)).on_hover_text("Load the models this API key can use (GET /models)").clicked() {
             start_api_model_scan(&mut app.ai_agent, ctx.clone());
         }
     });
 
     ui.horizontal(|ui| {
-        ui.label("Model manual:");
+        ui.label("Custom model:");
         ui.add(
             egui::TextEdit::singleline(&mut app.ai_agent.model)
-                .hint_text("mis. deepseek-chat / deepseek-reasoner / gpt-5.5")
+                .hint_text("e.g. deepseek-chat / deepseek-reasoner / gpt-5.5")
                 .desired_width(ui.available_width()),
         );
     });
 
     if let Some(err) = app.ai_agent.api_models_error.clone() {
-        ui.label(RichText::new(err).small().color(Color32::from_rgb(210, 50, 50)));
+        ui.add(egui::Label::new(RichText::new(err).small().color(Color32::from_rgb(210, 50, 50))).wrap());
     } else if app.ai_agent.api_models.is_empty() {
-        ui.label(RichText::new("Pilih model dari daftar, ketik id sendiri, lalu Connect API.").small().italics().color(t.text_dim));
+        ui.add(
+            egui::Label::new(RichText::new("Choose a model from the list or type an id, then connect.").small().italics().color(t.text_dim)).wrap(),
+        );
     } else {
-        ui.label(
-            RichText::new(format!(
-                "{} model di daftar (hasil /models + kandidat bawaan) — pilih dari daftar atau ketik id lain. Connect memverifikasi model terpilih lebih dulu.",
-                app.ai_agent.api_models.len()
-            ))
-            .small()
-            .color(t.text_dim),
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "{} models available (provider list + built-in candidates). Pick one or type another id; Connect verifies it first.",
+                    app.ai_agent.api_models.len()
+                ))
+                .small()
+                .color(t.text_dim),
+            )
+            .wrap(),
         );
     }
 
@@ -1160,14 +1088,14 @@ fn show_api_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tok
     ui.horizontal(|ui| {
         let is_connecting = app.ai_agent.api_status.is_connecting();
         let is_connected = app.ai_agent.api_status.is_connected();
-        let btn_text = if is_connecting {
-            "Connecting…"
+        let button_text = if is_connecting {
+            "Connecting..."
         } else if is_connected {
-            "Reconnect / Verify API"
+            "Verify / Reconnect"
         } else {
-            "Connect API"
+            "Connect"
         };
-        if ui.add_enabled(!is_connecting, egui::Button::new(btn_text)).clicked() {
+        if ui.add_enabled(!is_connecting, egui::Button::new(button_text)).clicked() {
             start_api_verify(&mut app.ai_agent, ctx.clone());
         }
         if (is_connected || is_connecting) && ui.button("Disconnect").clicked() {
@@ -1176,23 +1104,23 @@ fn show_api_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tok
     });
 }
 
-/// Terminal Agent configuration: User selects CLI Agent + Model, and verifies which models their account can use.
+/// Terminal CLI agent configuration: CLI agent, model and per-account model check.
 fn show_terminal_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens) {
     ui.horizontal(|ui| {
-        ui.label("CLI Agent:");
+        ui.label("CLI agent:");
         let current = app.ai_agent.cli_agent;
         craft_ui::ComboBox::from_id_salt("ai_cli_combo")
             .selected_text(current.label())
             .width((ui.available_width() - 8.0).max(120.0))
             .show_ui(ui, |ui| {
-                for &c in CliAgent::ALL {
-                    if ui.selectable_label(c == current, c.label()).clicked() && c != current {
-                        app.ai_agent.set_cli_agent(c);
+                for &agent in CliAgent::ALL {
+                    if ui.selectable_label(agent == current, agent.label()).clicked() && agent != current {
+                        app.ai_agent.set_cli_agent(agent);
                     }
                 }
             })
             .response
-            .accessible_name("CLI Agent");
+            .accessible_name("CLI agent");
     });
 
     if app.ai_agent.cli_agent == CliAgent::Custom {
@@ -1204,12 +1132,11 @@ fn show_terminal_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t:
         });
     }
 
-    // Model Selection & Per-User Verification
     let selected_badge = app
         .ai_agent
         .cli_models
         .iter()
-        .find(|m| m.id == app.ai_agent.cli_model)
+        .find(|model| model.id == app.ai_agent.cli_model)
         .map(CliModelInfo::badge_label)
         .unwrap_or_else(|| app.ai_agent.cli_model.clone());
 
@@ -1220,70 +1147,60 @@ fn show_terminal_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t:
             .selected_text(selected_badge)
             .width((ui.available_width() - 78.0).max(110.0))
             .show_ui(ui, |ui| {
-                let list = app.ai_agent.cli_models.clone();
-                for item in list {
-                    let is_sel = app.ai_agent.cli_model == item.id;
-                    let label_text = match &item.access {
+                let models = app.ai_agent.cli_models.clone();
+                for item in models {
+                    let is_selected = app.ai_agent.cli_model == item.id;
+                    let label = match &item.access {
                         CliModelAccess::Usable => RichText::new(item.badge_label()).color(Color32::from_rgb(31, 157, 85)),
                         CliModelAccess::Unavailable(_) => RichText::new(item.badge_label()).color(Color32::from_rgb(210, 50, 50)),
                         CliModelAccess::Unknown => RichText::new(item.badge_label()),
                     };
-                    let resp = ui.selectable_label(is_sel, label_text);
-                    let resp = if let CliModelAccess::Unavailable(reason) = &item.access {
-                        resp.on_hover_text(format!("Tidak dapat digunakan: {reason}"))
+                    let response = ui.selectable_label(is_selected, label);
+                    let response = if let CliModelAccess::Unavailable(reason) = &item.access {
+                        response.on_hover_text(format!("Unavailable: {reason}"))
                     } else {
-                        resp
+                        response
                     };
-                    if resp.clicked() && !is_sel {
+                    if response.clicked() && !is_selected {
                         model_changed_to = Some(item.id.clone());
                     }
                 }
             })
             .response
-            .accessible_name("Model Terminal");
+            .accessible_name("Model");
 
         let scanning = app.ai_agent.cli_scanning_models || app.ai_agent.cli_status.is_connecting();
-        let scan_label = if app.ai_agent.cli_scanning_models { "Cek…" } else { "Cek" };
-        if ui
-            .add_enabled(!scanning, egui::Button::new(scan_label))
-            .on_hover_text("Verifikasi model mana saja yang dapat digunakan oleh akun Anda")
-            .clicked()
-        {
+        let scan_label = if app.ai_agent.cli_scanning_models { "Checking..." } else { "Check" };
+        if ui.add_enabled(!scanning, egui::Button::new(scan_label)).on_hover_text("Check which models your account can use").clicked() {
             start_cli_scan_all_models(&mut app.ai_agent, ctx.clone());
         }
     });
 
     if let Some(new_model) = model_changed_to {
         app.ai_agent.cli_model = new_model;
-        // Automatically verify the newly chosen model when selected!
         start_cli_verify(&mut app.ai_agent, ctx.clone());
     }
 
-    // Show summary of verified usable models if any have been checked
-    let usable_count = app.ai_agent.cli_models.iter().filter(|m| m.access == CliModelAccess::Usable).count();
-    let unavail_count = app.ai_agent.cli_models.iter().filter(|m| matches!(m.access, CliModelAccess::Unavailable(_))).count();
-    if usable_count > 0 || unavail_count > 0 {
-        ui.label(
-            RichText::new(format!("Status Model Akun: {usable_count} bisa digunakan, {unavail_count} tidak tersedia/kuota"))
-                .small()
-                .color(t.text_dim),
-        );
+    let usable_count = app.ai_agent.cli_models.iter().filter(|model| model.access == CliModelAccess::Usable).count();
+    let unavailable_count = app.ai_agent.cli_models.iter().filter(|model| matches!(model.access, CliModelAccess::Unavailable(_))).count();
+    if usable_count > 0 || unavailable_count > 0 {
+        ui.label(RichText::new(format!("Account models: {usable_count} usable, {unavailable_count} unavailable")).small().color(t.text_dim));
     } else {
-        ui.label(RichText::new("Pilih model lalu klik Connect untuk memverifikasi akses model pada akun Anda.").small().italics().color(t.text_dim));
+        ui.add(egui::Label::new(RichText::new("Pick a model, then connect to verify it.").small().italics().color(t.text_dim)).wrap());
     }
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         let is_connecting = app.ai_agent.cli_status.is_connecting();
         let is_connected = app.ai_agent.cli_status.is_connected();
-        let btn_text = if is_connecting {
-            "Verifying CLI & Model…"
+        let button_text = if is_connecting {
+            "Verifying..."
         } else if is_connected {
-            "Verify / Reconnect Model"
+            "Verify / Reconnect"
         } else {
-            "Connect Terminal Agent"
+            "Connect"
         };
-        if ui.add_enabled(!is_connecting, egui::Button::new(btn_text)).clicked() {
+        if ui.add_enabled(!is_connecting, egui::Button::new(button_text)).clicked() {
             start_cli_verify(&mut app.ai_agent, ctx.clone());
         }
         if (is_connected || is_connecting) && ui.button("Disconnect").clicked() {
@@ -1292,7 +1209,7 @@ fn show_terminal_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t:
     });
 }
 
-/// Local Ollama configuration: Automatically identifies models installed in Ollama (`ollama list` / `/api/tags`).
+/// Local Ollama configuration: URL and installed models.
 fn show_ollama_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens) {
     ui.horizontal(|ui| {
         ui.label("Ollama URL:");
@@ -1300,14 +1217,14 @@ fn show_ollama_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &
     });
 
     ui.horizontal(|ui| {
-        ui.label("Installed Model:");
+        ui.label("Installed model:");
         let has_models = !app.ai_agent.ollama_models.is_empty();
         let selected_text = if app.ai_agent.ollama_scanning {
-            "Scanning Ollama…".to_string()
+            "Scanning Ollama...".to_string()
         } else if has_models {
             app.ai_agent.ollama_model.clone()
         } else {
-            "(Tidak ada model terinstall)".to_string()
+            "(no models installed)".to_string()
         };
 
         ui.add_enabled_ui(has_models && !app.ai_agent.ollama_scanning, |ui| {
@@ -1315,45 +1232,40 @@ fn show_ollama_config(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &
                 .selected_text(selected_text)
                 .width((ui.available_width() - 78.0).max(110.0))
                 .show_ui(ui, |ui| {
-                    let list = app.ai_agent.ollama_models.clone();
-                    for m in list {
-                        if ui.selectable_label(app.ai_agent.ollama_model == m, &m).clicked() {
-                            app.ai_agent.ollama_model = m;
+                    let models = app.ai_agent.ollama_models.clone();
+                    for model in models {
+                        if ui.selectable_label(app.ai_agent.ollama_model == model, &model).clicked() {
+                            app.ai_agent.ollama_model = model;
                         }
                     }
                 })
                 .response
-                .accessible_name("Model Ollama");
+                .accessible_name("Installed model");
         });
 
-        let scan_btn = if app.ai_agent.ollama_scanning { "Scan…" } else { "Scan ulang" };
-        if ui
-            .add_enabled(!app.ai_agent.ollama_scanning, egui::Button::new(scan_btn))
-            .on_hover_text("Deteksi ulang model yang terinstall di Ollama")
-            .clicked()
+        let scan_label = if app.ai_agent.ollama_scanning { "Scanning..." } else { "Scan" };
+        if ui.add_enabled(!app.ai_agent.ollama_scanning, egui::Button::new(scan_label)).on_hover_text("Scan the models installed in Ollama").clicked()
         {
             start_ollama_scan(&mut app.ai_agent, ctx.clone());
         }
     });
 
     if app.ai_agent.ollama_scanning {
-        ui.label(RichText::new("Mendeteksi model yang terinstall di Ollama…").small().italics().color(t.text_dim));
+        ui.label(RichText::new("Detecting models installed in Ollama...").small().italics().color(t.text_dim));
     } else if let Some(err) = &app.ai_agent.ollama_scan_error {
-        ui.label(RichText::new(err.clone()).small().color(Color32::from_rgb(210, 50, 50)));
+        ui.add(egui::Label::new(RichText::new(err.clone()).small().color(Color32::from_rgb(210, 50, 50))).wrap());
     } else if app.ai_agent.ollama_scanned && app.ai_agent.ollama_models.is_empty() {
-        ui.label(
-            RichText::new(
-                "Tidak ada model yang terinstall di Ollama (0 model ditemukan). \
-Jalankan `ollama pull llama3.2` di terminal, lalu klik Scan.",
+        ui.add(
+            egui::Label::new(
+                RichText::new("No models installed. Run `ollama pull llama3.2` in a terminal, then Scan.")
+                    .small()
+                    .color(Color32::from_rgb(220, 140, 0)),
             )
-            .small()
-            .color(Color32::from_rgb(220, 140, 0)),
+            .wrap(),
         );
     } else if !app.ai_agent.ollama_models.is_empty() {
         ui.label(
-            RichText::new(format!("OK Terdeteksi {} model terinstall di Ollama.", app.ai_agent.ollama_models.len()))
-                .small()
-                .color(Color32::from_rgb(31, 157, 85)),
+            RichText::new(format!("{} models installed in Ollama.", app.ai_agent.ollama_models.len())).small().color(Color32::from_rgb(31, 157, 85)),
         );
     }
 
@@ -1362,14 +1274,14 @@ Jalankan `ollama pull llama3.2` di terminal, lalu klik Scan.",
         let is_connecting = app.ai_agent.ollama_status.is_connecting();
         let is_connected = app.ai_agent.ollama_status.is_connected();
         let can_connect = !is_connecting && !app.ai_agent.ollama_models.is_empty();
-        let btn_text = if is_connecting {
-            "Connecting to Ollama…"
+        let button_text = if is_connecting {
+            "Connecting..."
         } else if is_connected {
-            "Reconnect Ollama"
+            "Reconnect"
         } else {
-            "Connect Ollama"
+            "Connect"
         };
-        if ui.add_enabled(can_connect, egui::Button::new(btn_text)).clicked() {
+        if ui.add_enabled(can_connect, egui::Button::new(button_text)).clicked() {
             start_ollama_verify(&mut app.ai_agent, ctx.clone());
         }
         if (is_connected || is_connecting) && ui.button("Disconnect").clicked() {
@@ -1380,119 +1292,130 @@ Jalankan `ollama pull llama3.2` di terminal, lalu klik Scan.",
 
 fn show_status_badge(status: &ConnStatus, ui: &mut Ui, t: &Tokens) {
     let (dot_color, text) = match status {
-        ConnStatus::Disconnected => (t.text_dim, "Status: Not connected".to_string()),
-        ConnStatus::Connecting => (Color32::from_rgb(230, 168, 0), "Status: Verifying connection & model…".to_string()),
+        ConnStatus::Disconnected => (t.text_dim, "Status: not connected".to_string()),
+        ConnStatus::Connecting => (Color32::from_rgb(230, 168, 0), "Status: verifying connection and model...".to_string()),
         ConnStatus::Connected(info) => (Color32::from_rgb(31, 157, 85), format!("Connected: {info}")),
-        ConnStatus::Failed(err) => (Color32::from_rgb(210, 50, 50), format!("Connection Failed: {err}")),
+        ConnStatus::Failed(err) => (Color32::from_rgb(210, 50, 50), format!("Connection failed: {err}")),
     };
     ui.horizontal_wrapped(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.5, dot_color);
-        ui.label(RichText::new(text).color(dot_color).strong());
+        ui.add(egui::Label::new(RichText::new(text).color(dot_color).strong()).wrap());
     });
 }
 
-fn show_chat_panel(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens) {
-    let connected_modes: Vec<AgentMode> =
-        [AgentMode::Api, AgentMode::Terminal, AgentMode::Ollama].into_iter().filter(|&m| app.ai_agent.status_of(m).is_connected()).collect();
-
+/// The pane's single subsection: what the agent has been asked and what it did.
+fn show_history(app: &mut SheetApp, ui: &mut Ui, ctx: &egui::Context, t: &Tokens) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Chat (MCP Active)").font(theme::ui_bold(13.0)));
-        if connected_modes.len() > 1 {
-            craft_ui::ComboBox::from_id_salt("ai_active_chat_backend")
-                .selected_text(app.ai_agent.active_chat_backend.short_label())
-                .width(115.0)
-                .show_ui(ui, |ui| {
-                    for &m in &connected_modes {
-                        if ui.selectable_label(app.ai_agent.active_chat_backend == m, m.short_label()).clicked() {
-                            app.ai_agent.active_chat_backend = m;
-                        }
-                    }
-                })
-                .response
-                .accessible_name("Chat backend");
-        } else if let Some(&only) = connected_modes.first() {
-            ui.label(RichText::new(format!("[{}]", only.short_label())).small().color(Color32::from_rgb(31, 157, 85)));
-        }
+        ui.label(RichText::new("History").font(theme::ui_bold(13.0)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Clear").on_hover_text("Clear chat history").clicked() {
-                app.ai_agent.messages.clear();
-            }
             if app.ai_agent.running && ui.small_button("Stop").clicked() {
                 app.ai_agent.cancel_task();
             }
+            if !app.ai_agent.messages.is_empty() && ui.small_button("Clear").on_hover_text("Clear history").clicked() {
+                app.ai_agent.messages.clear();
+            }
         });
     });
-
     ui.add_space(4.0);
 
-    let input_h = 68.0;
-    let chat_h = (ui.available_height() - input_h - 12.0).max(140.0);
+    let connected = app.ai_agent.any_connected();
+    let input_height = if connected { 86.0 } else { 0.0 };
+    let history_height = (ui.available_height() - input_height - 12.0).max(120.0);
 
-    egui::ScrollArea::vertical().id_salt("ai_chat_scroll").max_height(chat_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-        for entry in &app.ai_agent.messages {
-            match entry {
-                ChatEntry::User(msg) => {
-                    egui::Frame::NONE
-                        .fill(t.accent.gamma_multiply(0.18))
-                        .corner_radius(6.0)
-                        .inner_margin(7.0)
-                        .stroke(Stroke::new(1.0, t.accent.gamma_multiply(0.5)))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(RichText::new("You").small().strong().color(t.accent));
-                            ui.label(msg);
-                        });
+    if app.ai_agent.messages.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new("No activity yet. Ask the agent to do something and its actions will appear here.").small().italics().color(t.text_dim),
+            )
+            .wrap(),
+        );
+        ui.add_space(4.0);
+    } else {
+        egui::ScrollArea::vertical().id_salt("ai_history_scroll").max_height(history_height).auto_shrink([false, false]).stick_to_bottom(true).show(
+            ui,
+            |ui| {
+                ui.set_width(ui.available_width());
+                for entry in &app.ai_agent.messages {
+                    match entry {
+                        ChatEntry::User(message) => {
+                            egui::Frame::NONE
+                                .fill(t.accent.gamma_multiply(0.18))
+                                .corner_radius(6.0)
+                                .inner_margin(7.0)
+                                .stroke(Stroke::new(1.0, t.accent.gamma_multiply(0.5)))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.label(RichText::new("You").small().strong().color(t.accent));
+                                    ui.add(egui::Label::new(message).wrap());
+                                });
+                        }
+                        ChatEntry::Assistant(message) => {
+                            egui::Frame::NONE.fill(t.menu_bg).corner_radius(6.0).inner_margin(8.0).stroke(Stroke::new(1.0, t.separator)).show(
+                                ui,
+                                |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.label(RichText::new("AI Agent").small().strong().color(Color32::from_rgb(31, 157, 85)));
+                                    ui.add_space(2.0);
+                                    render_clean_assistant_message(ui, message, t);
+                                },
+                            );
+                        }
+                        ChatEntry::ToolCall { name: _, summary, is_error } => {
+                            let accent_color = if *is_error { Color32::from_rgb(210, 50, 50) } else { Color32::from_rgb(31, 157, 85) };
+                            let icon = if *is_error { "X" } else { "OK" };
+                            let clean_summary = summary.replace('*', "");
+                            egui::Frame::NONE
+                                .fill(t.window)
+                                .corner_radius(4.0)
+                                .inner_margin(egui::Margin::symmetric(7, 4))
+                                .stroke(Stroke::new(1.0, accent_color.gamma_multiply(0.45)))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new(icon).small().strong().color(accent_color));
+                                        ui.add(
+                                            egui::Label::new(RichText::new(clean_summary).small().color(if *is_error {
+                                                accent_color
+                                            } else {
+                                                t.text
+                                            }))
+                                            .wrap(),
+                                        );
+                                    });
+                                });
+                        }
+                        ChatEntry::System(message) => {
+                            ui.add(egui::Label::new(RichText::new(message).small().italics().color(t.text_dim)).wrap());
+                        }
+                    }
+                    ui.add_space(4.0);
                 }
-                ChatEntry::Assistant(msg) => {
-                    egui::Frame::NONE.fill(t.menu_bg).corner_radius(6.0).inner_margin(8.0).stroke(Stroke::new(1.0, t.separator)).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(RichText::new("AI Agent").small().strong().color(Color32::from_rgb(31, 157, 85)));
-                        ui.add_space(2.0);
-                        render_clean_assistant_message(ui, msg, t);
+                if app.ai_agent.running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Agent is working...").small().italics().color(t.text_dim));
                     });
                 }
-                ChatEntry::ToolCall { name: _, summary, is_error } => {
-                    let accent_color = if *is_error { Color32::from_rgb(210, 50, 50) } else { Color32::from_rgb(31, 157, 85) };
-                    let icon = if *is_error { "X" } else { "OK" };
-                    let clean_summary = summary.replace('*', "");
-                    egui::Frame::NONE
-                        .fill(t.window)
-                        .corner_radius(4.0)
-                        .inner_margin(egui::Margin::symmetric(7, 4))
-                        .stroke(Stroke::new(1.0, accent_color.gamma_multiply(0.45)))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(icon).small().strong().color(accent_color));
-                                ui.label(RichText::new(clean_summary).small().color(if *is_error { accent_color } else { t.text }));
-                            });
-                        });
-                }
-                ChatEntry::System(msg) => {
-                    ui.label(RichText::new(msg).small().italics().color(t.text_dim));
-                }
-            }
-            ui.add_space(4.0);
-        }
-        if app.ai_agent.running {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Agent sedang mengerjakan task…").small().italics().color(t.text_dim));
-            });
-        }
-    });
+            },
+        );
+    }
 
     ui.add_space(4.0);
+
+    if !connected {
+        ui.add(egui::Label::new(RichText::new("Connect a backend above to give the agent work.").small().italics().color(t.text_dim)).wrap());
+        return;
+    }
 
     let mut trigger_send = false;
     ui.horizontal(|ui| {
-        let resp = ui.add_sized(
+        let response = ui.add_sized(
             vec2((ui.available_width() - 62.0).max(80.0), 46.0),
             egui::TextEdit::multiline(&mut app.ai_agent.chat_input)
-                .hint_text("Minta AI Agent membuat data, rumus, tabel, format, chart… (Enter untuk kirim)"),
+                .hint_text("Ask the AI Agent to build data, formulas, tables, formats, charts... (Enter to send)"),
         );
-        if resp.has_focus()
+        if response.has_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
             && !app.ai_agent.chat_input.trim().is_empty()
             && !app.ai_agent.running
@@ -1585,7 +1508,7 @@ fn sanitize_and_compact_reply(raw: &str) -> String {
     }
 
     let joined = out_lines.join("\n");
-    if joined.trim().is_empty() { "Selesai.".to_string() } else { joined }
+    if joined.trim().is_empty() { "Done.".to_string() } else { joined }
 }
 
 /// Render an assistant message with clean native typography, structured bullets, bold labels, and zero `*` characters.
@@ -1764,7 +1687,7 @@ fn start_api_model_scan(state: &mut AiAgentState, ctx: egui::Context) {
     };
     let key = state.api_key.trim().to_string();
     if key.is_empty() {
-        let msg = "Isi API Key dulu untuk memuat daftar model dari provider.";
+        let msg = "Enter the API key first to load the provider's model list.";
         state.api_models_error = Some(msg.into());
         state.notify_error(msg);
         return;
@@ -3615,7 +3538,7 @@ fn detect_sheet_tables(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::
             used_range: None,
             tables: Vec::new(),
             existing_charts,
-            markdown_grid: "(Sheet masih kosong / belum ada data di sel mana pun)".into(),
+            markdown_grid: "(The sheet is empty — no cells have data yet)".into(),
         });
     };
     let used_range = RangeRef::parse(used_str)?;
@@ -4341,51 +4264,51 @@ fn prompt_wants_delete_charts(prompt: &str) -> bool {
 fn humanize_tool_start(name: &str, args: &Value) -> String {
     let r = args.get("range").or_else(|| args.get("cell")).and_then(Value::as_str).unwrap_or("");
     match name {
-        "inspect_workbook" => "Memeriksa struktur tabel di sheet aktif…".into(),
+        "inspect_workbook" => "Inspecting the active sheet structure…".into(),
         "read_range" => {
             if r.is_empty() {
-                "Membaca data tabel di sheet aktif…".into()
+                "Reading the active sheet data…".into()
             } else {
-                format!("Membaca data pada sel {r}…")
+                format!("Reading cell {r}…")
             }
         }
         "write_range" => {
             let rows = args.get("values").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
             if rows > 0 && !r.is_empty() {
-                format!("Menulis {rows} baris data ke {r}…")
+                format!("Writing {rows} rows to {r}…")
             } else if !r.is_empty() {
-                format!("Menulis data ke {r}…")
+                format!("Writing data to {r}…")
             } else {
-                "Menulis data ke tabel…".into()
+                "Writing data to the table…".into()
             }
         }
         "set_cell" => {
             if !r.is_empty() {
-                format!("Mengisi sel {r}…")
+                format!("Setting cell {r}…")
             } else {
-                "Mengisi nilai sel…".into()
+                "Setting the cell value…".into()
             }
         }
         "format_range" => {
             if !r.is_empty() {
-                format!("Menyesuaikan format tabel pada {r}…")
+                format!("Formatting {r}…")
             } else {
-                "Menyesuaikan format tabel…".into()
+                "Formatting the table…".into()
             }
         }
         "create_table" => {
             if !r.is_empty() {
-                format!("Membuat tabel terformat pada {r}…")
+                format!("Creating a table on {r}…")
             } else {
-                "Membuat tabel terformat…".into()
+                "Creating the table…".into()
             }
         }
         "insert_chart" => {
             let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-            if !title.is_empty() { format!("Membuat visual {title}…") } else { "Membuat visual perbandingan…".into() }
+            if !title.is_empty() { format!("Creating chart {title}…") } else { "Creating a comparison chart…".into() }
         }
-        "clear_range" => "Menghapus data, warna latar & widget grafik…".into(),
-        "delete_chart" => "Menghapus widget grafik…".into(),
+        "clear_range" => "Clearing data, fills and chart widgets…".into(),
+        "delete_chart" => "Deleting chart widgets…".into(),
         "evaluate_formula" => "Menghitung rumus…".into(),
         "list_commands" => {
             let search = args.get("search").and_then(Value::as_str).unwrap_or("");
@@ -4393,18 +4316,18 @@ fn humanize_tool_start(name: &str, args: &Value) -> String {
         }
         "describe_command" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("command");
-            format!("Membaca detail command {cmd}…")
+            format!("Reading command details: {cmd}…")
         }
         "execute_commands" => {
             let n = args.get("commands").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-            format!("Menjalankan {n} command…")
+            format!("Running {n} commands…")
         }
         "list_functions" => "Mencari fungsi worksheet…".into(),
         "get_cell" => {
             if r.is_empty() {
-                "Membaca sel…".into()
+                "Reading the cell…".into()
             } else {
-                format!("Membaca sel {r}…")
+                format!("Reading cell {r}…")
             }
         }
         "select" => {
@@ -4425,13 +4348,13 @@ fn humanize_tool_start(name: &str, args: &Value) -> String {
         "redo" => "Redo…".into(),
         "ui_control" => {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("ui");
-            format!("Menjalankan aksi UI {method}…")
+            format!("Running UI action {method}…")
         }
         "execute_command" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("command");
-            format!("Menjalankan perintah {cmd}…")
+            format!("Running command {cmd}…")
         }
-        _ => format!("Menjalankan {name}…"),
+        _ => format!("Running {name}…"),
     }
 }
 
@@ -4439,66 +4362,66 @@ fn humanize_tool_start(name: &str, args: &Value) -> String {
 fn humanize_tool_done(name: &str, args: &Value, result: &Value) -> String {
     let r = args.get("range").or_else(|| args.get("cell")).or_else(|| result.get("range")).and_then(Value::as_str).unwrap_or("");
     match name {
-        "inspect_workbook" => "Struktur tabel berhasil diperiksa".into(),
+        "inspect_workbook" => "Checked the active sheet structure".into(),
         "read_range" => {
             if !r.is_empty() {
-                format!("Data pada {r} selesai dibaca")
+                format!("Read data on {r}")
             } else {
-                "Data sheet aktif selesai dibaca".into()
+                "Read the active sheet data".into()
             }
         }
         "write_range" => {
             let rows = args.get("values").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
             if rows > 0 && !r.is_empty() {
-                format!("Data berhasil ditulis ke {r} ({rows} baris)")
+                format!("Wrote {rows} rows to {r}")
             } else if !r.is_empty() {
-                format!("Data berhasil ditulis ke {r}")
+                format!("Wrote data to {r}")
             } else {
-                "Data berhasil ditulis ke tabel".into()
+                "Wrote data to the table".into()
             }
         }
         "set_cell" => {
             if !r.is_empty() {
-                format!("Sel {r} berhasil diperbarui")
+                format!("Updated cell {r}")
             } else {
-                "Sel berhasil diperbarui".into()
+                "Updated the cell".into()
             }
         }
         "format_range" => {
             if !r.is_empty() {
-                format!("Format tabel disesuaikan pada {r}")
+                format!("Formatted {r}")
             } else {
-                "Format tabel berhasil disesuaikan".into()
+                "Formatted the table".into()
             }
         }
         "create_table" => {
             if !r.is_empty() {
-                format!("Tabel berhasil dibuat pada {r}")
+                format!("Created a table on {r}")
             } else {
-                "Tabel berhasil dibuat".into()
+                "Created the table".into()
             }
         }
         "insert_chart" => {
             let ctype = result.get("type").or_else(|| args.get("type")).and_then(Value::as_str).unwrap_or("chart");
             let title = result.get("title").or_else(|| args.get("title")).and_then(Value::as_str).unwrap_or("Visual");
             let at = result.get("at").or_else(|| args.get("at")).and_then(Value::as_str).unwrap_or("");
-            if !at.is_empty() { format!("Visual {ctype} dibuat: {title} (posisi {at})") } else { format!("Visual {ctype} dibuat: {title}") }
+            if !at.is_empty() { format!("Created {ctype} chart: {title} (at {at})") } else { format!("Created {ctype} chart: {title}") }
         }
-        "clear_range" => "Data, warna latar, tabel & widget grafik berhasil dihapus".into(),
-        "delete_chart" => "Widget grafik berhasil dihapus".into(),
-        "evaluate_formula" => "Rumus berhasil dievaluasi".into(),
-        "list_commands" => "Command GridCraft selesai dicari".into(),
-        "describe_command" => "Detail command selesai dibaca".into(),
+        "clear_range" => "Cleared data, fills, tables and chart widgets".into(),
+        "delete_chart" => "Deleted chart widgets".into(),
+        "evaluate_formula" => "Formula evaluated".into(),
+        "list_commands" => "Searched commands".into(),
+        "describe_command" => "Read command details".into(),
         "execute_commands" => {
             let n = args.get("commands").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-            format!("{n} command selesai dijalankan")
+            format!("{n} commands executed")
         }
-        "list_functions" => "Daftar fungsi worksheet selesai dibaca".into(),
+        "list_functions" => "Read worksheet functions".into(),
         "get_cell" => {
             if r.is_empty() {
-                "Sel selesai dibaca".into()
+                "Read the cell".into()
             } else {
-                format!("Sel {r} selesai dibaca")
+                format!("Read cell {r}")
             }
         }
         "select" => {
@@ -4510,22 +4433,22 @@ fn humanize_tool_done(name: &str, args: &Value, result: &Value) -> String {
         }
         "sort_range" => {
             if r.is_empty() {
-                "Data selesai diurutkan".into()
+                "Sorted the data".into()
             } else {
-                format!("Data {r} selesai diurutkan")
+                format!("Sorted {r}")
             }
         }
-        "undo" => "Undo selesai".into(),
-        "redo" => "Redo selesai".into(),
+        "undo" => "Undone".into(),
+        "redo" => "Redone".into(),
         "ui_control" => {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("ui");
-            format!("Aksi UI {method} selesai")
+            format!("UI action {method} finished")
         }
         "execute_command" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("command");
-            format!("Perintah {cmd} selesai dijalankan")
+            format!("Command {cmd} finished")
         }
-        _ => format!("{name} selesai"),
+        _ => format!("{name} finished"),
     }
 }
 
@@ -4913,7 +4836,7 @@ fn ensure_post_turn_consistency(
             break;
         }
         let next_idx = turn_ctx.charts_inserted.len() + 1;
-        let _ = tx.send(WorkerEvent::ToolStart { name: "insert_chart".into(), args: format!("Membuat visual perbandingan #{next_idx}…") });
+        let _ = tx.send(WorkerEvent::ToolStart { name: "insert_chart".into(), args: format!("Creating comparison chart #{next_idx}…") });
         ctx.request_repaint();
         match smart_insert_chart(control_tx, ctx, &json!({}), turn_ctx) {
             Ok(v) => {
@@ -5305,18 +5228,15 @@ fn run_api_agent_loop(
     // Full tool access deliberately skips it: the model decides which clear command (and target) the
     // request needs, instead of a keyword heuristic wiping the whole sheet.
     if !full_tool_access && prompt_wants_delete_all(&turn_ctx.user_prompt) && requested_chart_count(&turn_ctx.user_prompt).is_none() {
-        let _ = tx
-            .send(WorkerEvent::ToolStart {
-                name: "clear_range".into(), args: "Menghapus seluruh data, warna latar, tabel, filter & grafik…".into()
-            });
+        let _ =
+            tx.send(WorkerEvent::ToolStart { name: "clear_range".into(), args: "Clearing all data, fills, tables, filters and charts…".into() });
         let _ = call_control(&control_tx, ctx, "ai.deep_clear", json!({"all": true}));
         let _ = tx.send(WorkerEvent::ToolDone {
             name: "clear_range".into(),
-            summary: "Data, warna latar, tabel, auto-filter & widget grafik berhasil dihapus".into(),
+            summary: "Cleared data, fills, tables, filters and chart widgets".into(),
             is_error: false,
         });
-        let _ = tx
-            .send(WorkerEvent::AssistantReply("Seluruh data, warna latar, tabel, filter, dan widget grafik pada sheet aktif telah dihapus.".into()));
+        let _ = tx.send(WorkerEvent::AssistantReply("Cleared all data, fills, tables, filters and chart widgets on the active sheet.".into()));
         ctx.request_repaint();
         return;
     }
@@ -5327,17 +5247,25 @@ fn run_api_agent_loop(
     }
 
     let live_wb_context = build_live_workbook_context(&control_tx, ctx);
-    let full_system_prompt = if full_tool_access {
+    let local_note = if is_local {
+        // Local models have less context and weaker tool calling: tell them explicitly that the
+        // context below is complete and that they must act through tools, one step at a time.
+        "LOCAL MODEL NOTE: the live workbook context and command catalog below are complete for the active sheet. Read them before acting, use tools for every change, and take one step at a time.\n\n"
+    } else {
+        ""
+    };
+    let access_section = if full_tool_access {
         let catalog_text = if include_command_catalog {
             let catalog = fetch_command_catalog(&control_tx, ctx);
-            crate::ai_tools::catalog_prompt(&catalog, if is_local { 9000 } else { 20000 })
+            crate::ai_tools::catalog_prompt(&catalog, if is_local { 14000 } else { 20000 })
         } else {
             String::new()
         };
-        format!("{SYSTEM_PROMPT}\n\n{}\n\n{}\n\n{catalog_text}\n\n{live_wb_context}", crate::ai_tools::FEATURE_GUIDE, crate::ai_tools::CHEAT_SHEET)
+        format!("{}\n\n{}\n\n{catalog_text}", crate::ai_tools::FEATURE_GUIDE, crate::ai_tools::CHEAT_SHEET)
     } else {
-        format!("{SYSTEM_PROMPT}\n\n{live_wb_context}")
+        String::new()
     };
+    let full_system_prompt = format!("{}\n\n{SYSTEM_PROMPT}\n\n{local_note}{access_section}\n\n{live_wb_context}", crate::ai_tools::GROUND_RULES);
 
     let mut messages = vec![json!({"role": "system", "content": full_system_prompt})];
     for (role, content) in history {
@@ -5470,7 +5398,7 @@ fn run_api_agent_loop(
                 if !clean.is_empty() {
                     let _ = tx.send(WorkerEvent::AssistantReply(clean));
                 } else {
-                    let _ = tx.send(WorkerEvent::AssistantReply("Selesai.".into()));
+                    let _ = tx.send(WorkerEvent::AssistantReply("Done.".into()));
                 }
                 return;
             }
@@ -5569,7 +5497,7 @@ fn run_api_agent_loop(
                     let _ = tx.send(WorkerEvent::Error(turn_ctx.tool_errors.join("; ")));
                     return;
                 }
-                let _ = tx.send(WorkerEvent::AssistantReply(if clean.is_empty() { "Selesai.".into() } else { clean }));
+                let _ = tx.send(WorkerEvent::AssistantReply(if clean.is_empty() { "Done.".into() } else { clean }));
                 return;
             }
             if !combined.is_empty() {
@@ -5620,7 +5548,7 @@ fn run_api_agent_loop(
     // instead of leaving the chat without an answer (the executed commands stay applied).
     if !replied {
         let _ = tx.send(WorkerEvent::AssistantReply(format!(
-            "Selesai — batas {max_steps} langkah tercapai. Perintah yang sudah berhasil tetap dijalankan; minta saya melanjutkan bila masih ada yang kurang."
+            "Done — reached the {max_steps} step limit. Commands that succeeded were applied; ask me to continue if more is needed."
         )));
         ctx.request_repaint();
     }
@@ -5692,6 +5620,8 @@ fn build_terminal_prompt(
     ctx: &egui::Context,
 ) -> String {
     let mut prompt = String::new();
+    prompt.push_str(crate::ai_tools::GROUND_RULES);
+    prompt.push('\n');
     prompt.push_str("You are the built-in AI Agent controlling a live GridCraft spreadsheet.\n");
     prompt.push_str(
         "IMPORTANT: Do NOT run any shell, bash, file, or directory commands! Do NOT inspect the filesystem. Respond immediately in text!\n",
@@ -5764,18 +5694,15 @@ fn run_cli_agent_turn(
     // Deterministic fast-path for explicit "hapus semua" / "clear all" requests. Full tool access
     // skips it so the model decides which clear command (and target) the request needs.
     if !full_tool_access && prompt_wants_delete_all(&turn_ctx.user_prompt) && requested_chart_count(&turn_ctx.user_prompt).is_none() {
-        let _ = tx
-            .send(WorkerEvent::ToolStart {
-                name: "clear_range".into(), args: "Menghapus seluruh data, warna latar, tabel, filter & grafik…".into()
-            });
+        let _ =
+            tx.send(WorkerEvent::ToolStart { name: "clear_range".into(), args: "Clearing all data, fills, tables, filters and charts…".into() });
         let _ = call_control(&control_tx, ctx, "ai.deep_clear", json!({"all": true}));
         let _ = tx.send(WorkerEvent::ToolDone {
             name: "clear_range".into(),
-            summary: "Data, warna latar, tabel, auto-filter & widget grafik berhasil dihapus".into(),
+            summary: "Cleared data, fills, tables, filters and chart widgets".into(),
             is_error: false,
         });
-        let _ = tx
-            .send(WorkerEvent::AssistantReply("Seluruh data, warna latar, tabel, filter, dan widget grafik pada sheet aktif telah dihapus.".into()));
+        let _ = tx.send(WorkerEvent::AssistantReply("Cleared all data, fills, tables, filters and chart widgets on the active sheet.".into()));
         ctx.request_repaint();
         return;
     }
@@ -5834,7 +5761,7 @@ fn run_cli_agent_turn(
                 if !final_text.is_empty() {
                     let _ = tx.send(WorkerEvent::AssistantReply(final_text.to_string()));
                 } else {
-                    let _ = tx.send(WorkerEvent::AssistantReply("Selesai.".into()));
+                    let _ = tx.send(WorkerEvent::AssistantReply("Done.".into()));
                 }
                 return;
             }

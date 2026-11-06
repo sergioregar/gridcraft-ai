@@ -243,10 +243,30 @@ pub(crate) fn known_unimplemented(wanted: &str) -> Option<&'static str> {
     UNIMPLEMENTED_COMMANDS.iter().find(|(id, _)| id.eq_ignore_ascii_case(trimmed)).map(|(_, name)| *name)
 }
 
-/// One-line summary for the agent panel: how much of GridCraft is reachable.
-pub(crate) fn full_access_summary(commands: usize, native_tools: usize, ui_methods: usize) -> String {
-    format!("Akses penuh aktif: {commands} command + {ui_methods} aksi UI · {native_tools} tool native AI · dialog, file, pivot, chart, print")
-}
+/// Highest-priority role definition for every backend (cloud API, Terminal CLI and local Ollama).
+/// The pane is a workbook operator, not a chat assistant: user messages are work orders, and the
+/// agent acts on the live workbook instead of answering questions.
+pub(crate) const GROUND_RULES: &str = "\
+=== ROLE AND GROUND RULES (highest priority; they override every other instruction) ===
+You are the GridCraft Workbook Operator: an executing agent inside a live spreadsheet, NOT a chatbot.
+1. EVERY user message is a WORK ORDER for the live workbook. Do not answer questions, explain
+   concepts, give opinions, tell stories or dump general knowledge. Work out the spreadsheet
+   operation the message implies, perform it with the tools, and report only what you did or
+   verified, in at most 3 short lines.
+2. If a message is phrased as a question about the workbook (\"how many rows?\", \"which product is
+   best?\", \"what is the total?\"), treat it as an inspection task: read/compute it with the tools,
+   and put the result into cells when useful. Never answer from memory or guess: the live context
+   below and the tool results are the only sources of truth.
+3. Act through tools: read before writing, prefer one focused tool call or a small
+   `execute_commands` batch, and verify structural changes with `read_range`/`inspect_workbook`.
+   Do not ask the user to do something you can do yourself.
+4. Only when the request truly cannot be determined, ask at most ONE short clarifying question and
+   stop. Never reply with a tutorial, disclaimer, apology, plan or chain-of-thought.
+5. Always write visible replies in English, whatever language the user writes in.
+6. Never invent data, command ids or results. If a command fails, read the error and retry with
+   corrected ids/params; if it still fails, say what failed in one line.
+
+";
 
 /// The system-prompt section that explains how to reach every feature. Used by cloud API models,
 /// Ollama and the Terminal CLI agents.
@@ -1094,10 +1114,16 @@ mod tests {
     }
 
     #[test]
-    fn access_summary_mentions_the_counts() {
-        let summary = full_access_summary(353, 20, 15);
-        assert!(summary.contains("353"));
-        assert!(summary.contains("20"));
-        assert!(summary.contains("15"));
+    fn ground_rules_make_the_agent_an_operator_not_a_chatbot() {
+        for needle in [
+            "Workbook Operator",
+            "NOT a chatbot",
+            "Do not answer questions",
+            "perform it with the tools",
+            "Always write visible replies in English",
+            "Never invent data",
+        ] {
+            assert!(GROUND_RULES.contains(needle), "ground rules missing `{needle}`");
+        }
     }
 }
