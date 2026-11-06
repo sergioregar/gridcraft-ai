@@ -243,6 +243,77 @@ pub(crate) fn known_unimplemented(wanted: &str) -> Option<&'static str> {
     UNIMPLEMENTED_COMMANDS.iter().find(|(id, _)| id.eq_ignore_ascii_case(trimmed)).map(|(_, name)| *name)
 }
 
+/// A1 letters for a 0-based column index (A, B, ..., Z, AA, ...).
+pub(crate) fn column_letters(mut col: u32) -> String {
+    let mut out = String::new();
+    loop {
+        let digit = (col % 26) as u8 + b'A';
+        out.insert(0, digit as char);
+        if col < 26 {
+            return out;
+        }
+        col = col / 26 - 1;
+    }
+}
+
+/// Whether a label reads like a totals/summary row ("TOTAL", "Subtotal", "Gross profit", "Net",
+/// "Jumlah", "Laba", "Rugi", ...). Used to style totals in generated reports.
+pub(crate) fn report_is_total_label(label: &str) -> bool {
+    let low = label.trim().to_ascii_lowercase();
+    let words = ["total", "subtotal", "sub total", "grand total", "gross", "net", "jumlah", "laba", "rugi", "balance"];
+    words.iter().any(|word| {
+        low == *word || low.starts_with(&format!("{word} ")) || low.starts_with(&format!("{word}:")) || low.starts_with(&format!("{word} -"))
+    })
+}
+
+/// A label-only row (first cell has text, every other cell empty): an income-statement section
+/// heading like "REVENUE" / "COST OF GOODS SOLD".
+pub(crate) fn report_is_section_row(row: &[Value]) -> bool {
+    let Some(first) = row.first() else { return false };
+    let has_label = first.as_str().is_some_and(|text| !text.trim().is_empty());
+    if !has_label {
+        return false;
+    }
+    !report_is_total_label(first.as_str().unwrap_or(""))
+        && row.iter().skip(1).all(|cell| cell.is_null() || cell.as_str().is_some_and(|text| text.trim().is_empty()))
+}
+
+/// A cell holds a number or a formula (the two things that need a numeric format/right alignment).
+pub(crate) fn report_cell_is_numeric(cell: &Value) -> bool {
+    if cell.is_number() {
+        return true;
+    }
+    match cell.as_str() {
+        Some(text) => {
+            let trimmed = text.trim();
+            trimmed.starts_with('=') || trimmed.trim_start_matches(['$', '€', '£', '¥']).replace([',', ' '], "").parse::<f64>().is_ok()
+        }
+        None => false,
+    }
+}
+
+/// 0-based column indices (skipping the label column) that hold numbers or formulas in `rows`.
+pub(crate) fn report_numeric_columns(rows: &[Vec<Value>], first_data_col: usize) -> Vec<usize> {
+    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    (first_data_col..ncols).filter(|col| rows.iter().any(|row| row.get(*col).is_some_and(report_cell_is_numeric))).collect()
+}
+
+/// Column widths (A1 letters, characters) for a report: the label column is wider than the
+/// numeric ones, and `overrides` ("A" -> 40) win over the defaults.
+pub(crate) fn report_column_widths(ncols: usize, label_chars: u32, number_chars: u32, overrides: &Map<String, Value>) -> Vec<(String, u32)> {
+    (0..ncols as u32)
+        .map(|col| {
+            let letters = column_letters(col);
+            let chars = overrides.get(&letters).and_then(Value::as_u64).map(|value| value.clamp(6, 120) as u32).unwrap_or(if col == 0 {
+                label_chars.max(12)
+            } else {
+                number_chars.max(8)
+            });
+            (letters, chars)
+        })
+        .collect()
+}
+
 /// Highest-priority role definition for every backend (cloud API, Terminal CLI and local Ollama).
 /// The pane is a workbook operator, not a chat assistant: user messages are work orders, and the
 /// agent acts on the live workbook instead of answering questions.
@@ -267,7 +338,8 @@ Decide the intent of every message first:
    write a title row, a header row, at least 10 plausible rows (unique product names or categories,
    quantities, unit prices, dates), formulas (quantity*price, a totals row), number formats, AutoFit the
    columns for readability, a clean table style, and a chart when asked. This is allowed: \"never invent data\" means never misreport
-   data that already exists, not refusing to generate sample data the user asked for.
+   the clean layout (merged title, readable widths, formats, totals) in one call. Never leave ### or
+   truncated labels in a finished sheet.
 Rules for every action: read before writing; prefer one focused tool call or a small
 execute_commands batch; verify structural edits with read_range/inspect_workbook; never fabricate
 command ids or results; if a command fails, read the error and retry once, then say what failed.
@@ -283,7 +355,8 @@ Discover with list_commands {\"search\":\"sort\"} (no search = whole catalog), d
 ids work: bold -> home.bold), batch with execute_commands {\"commands\":[...]}, list_functions for the
 514 worksheet functions. ui_control {\"method\":...,\"params\":...} reaches UI-only actions (ui.inspect,
 ui.ribbon, ui.dialog, app.language.*). Commands act on the ACTIVE sheet: pass range/sheet explicitly.
-Never claim a feature is missing before list_commands finds no match.
+For reports/tables prefer create_report (clean layout built in); use layout_sheet to fix a cramped or
+messy existing range. Never claim a feature is missing before list_commands finds no match.
 ";
 
 /// Prompt-ready recipes, condensed to keep the prompt light. Every example is a command this build
@@ -309,6 +382,7 @@ More: data.outlineSettings {summaryBelow,summaryRight}; edit.fillSeries {type:\"
 month|year\"}; formulas.errorChecking; pivot.options {enableShowDetails}; edit.goTo {reference};
 formulas.pasteName; review.workbookStatistics; app.checkForUpdates; ui.dialog {name:\"commandSearch|agents|
 journal\"}; view.theme; view.interfaceScale.
+Layout rules: for a new report prefer create_report {\"title\",\"subtitle?\",\"headers\",\"rows\",\"total_rows?\",\"number_format\",\"chart?\"}; to repair an existing messy range call layout_sheet {\"range\",\"header_row?\",\"number_columns?\",\"total_rows?\"}. Label column 34-42 chars, numeric columns 14-18, merged title row, bold header, numbers right-aligned with a format, totals bold with top+double border, freeze header, print area fit-to-page. Never leave ### or clipped text.
 ";
 
 /// Whitelisted control-channel methods for the `ui_control` tool. Everything else (quit, printing,
@@ -356,7 +430,17 @@ pub(crate) fn tool_names(full_access: bool, allow_ui: bool) -> Vec<&'static str>
         "execute_command",
     ];
     if full_access {
-        names.extend(["describe_command", "execute_commands", "list_functions", "select", "sort_range", "undo", "redo"]);
+        names.extend([
+            "describe_command",
+            "execute_commands",
+            "list_functions",
+            "select",
+            "sort_range",
+            "create_report",
+            "layout_sheet",
+            "undo",
+            "redo",
+        ]);
         if allow_ui {
             names.push("ui_control");
         }
@@ -672,6 +756,59 @@ pub(crate) fn openai_tools(full_access: bool, allow_ui: bool) -> Value {
                 "name": "redo",
                 "description": "Redo undone step(s).",
                 "parameters": {"type": "object", "properties": {"steps": {"type": "integer"}}}
+            }
+        }));
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "create_report",
+                "description": "Build a clean, readable table/report from scratch in one call: merged title, bold header row, readable column widths (no ###, no truncated labels), number formats, aligned numbers, section rows, bold totals with borders, optional chart, frozen header and print setup. Use this for any 'make a report/statement/list' request instead of writing cells one by one. Rows are arrays; the first column is the label column. Section rows are label-only rows (auto-detected when omitted); total rows are detected from labels like TOTAL, SUBTOTAL, GROSS, NET.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Report title, merged across all columns on row 1"},
+                        "subtitle": {"type": "string", "description": "Optional italic subtitle on row 2"},
+                        "headers": {"type": "array", "items": {"type": "string"}, "description": "Header row, e.g. [\"Product\",\"Category\",\"Qty\",\"Price\",\"Total\"]"},
+                        "rows": {
+                            "type": "array",
+                            "description": "Data rows, first cell is the label",
+                            "items": {"type": "array", "items": {"type": ["string", "number", "null"]}}
+                        },
+                        "section_rows": {"type": "array", "items": {"type": "integer"}, "description": "0-based row indices to style as section headers (auto-detected when omitted)"},
+                        "total_rows": {"type": "array", "items": {"type": "integer"}, "description": "0-based row indices to style as totals (auto-detected from labels when omitted)"},
+                        "number_format": {"type": "string", "description": "Number format for numeric columns (default #,##0.00)"},
+                        "label_width": {"type": "integer", "description": "Label column width in characters (default 38)"},
+                        "number_width": {"type": "integer", "description": "Width of each numeric column in characters (default 16)"},
+                        "column_widths": {"type": "object", "description": "Optional per-column widths in characters, e.g. {\"A\": 40, \"B\": 18}"},
+                        "chart": {"type": "object", "description": "Optional {\"type\":\"column|bar|line|pie\",\"title\":\"...\",\"at\":\"E2\"}"},
+                        "table_style": {"type": "boolean", "description": "Also apply a formatted table style (off by default for statements with sections)"},
+                        "freeze_header": {"type": "boolean", "description": "Freeze the title/header rows (default true)"},
+                        "print_setup": {"type": "boolean", "description": "Set print area, orientation and fit-to-page (default true)"}
+                    },
+                    "required": ["headers", "rows"]
+                }
+            }
+        }));
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "layout_sheet",
+                "description": "Fix the layout of an existing messy range/report without rewriting values: readable column widths (no ###), merged title (optional), bold header row, right-aligned numbers with a number format, bold borders on total rows, frozen header, print area and fit-to-page. Call this when a sheet looks cramped, text is truncated or numbers show ###.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "range": {"type": "string", "description": "A1 range to lay out; defaults to the used range"},
+                        "header_row": {"type": "integer", "description": "1-based header row (auto-detected when omitted)"},
+                        "label_column": {"type": "string", "description": "Column with labels (default A)"},
+                        "number_columns": {"type": "array", "items": {"type": "string"}, "description": "Columns with numbers, e.g. [\"B\",\"C\"] (auto-detected when omitted)"},
+                        "total_rows": {"type": "array", "items": {"type": "integer"}, "description": "1-based rows to style as totals (auto-detected from labels when omitted)"},
+                        "title_range": {"type": "string", "description": "Optional range to merge and style as the title, e.g. \"A1:C1\""},
+                        "number_format": {"type": "string", "description": "Number format for numeric columns (default #,##0.00)"},
+                        "autofit_widths": {"type": "boolean", "description": "Compute widths from content (default true)"},
+                        "freeze_header": {"type": "boolean"},
+                        "print_setup": {"type": "boolean"}
+                    }
+                }
             }
         }));
         if allow_ui {
@@ -1069,5 +1206,41 @@ mod tests {
         assert!(CHEAT_SHEET.contains("Report from scratch"), "missing the from-scratch report recipe");
         assert!(CHEAT_SHEET.contains("write_range"), "missing the data-creation tool");
         assert!(CHEAT_SHEET.contains("TOTAL"), "the report recipe must build a totals row");
+        assert!(
+            FEATURE_GUIDE.contains("create_report") && CHEAT_SHEET.contains("create_report"),
+            "the report layout tools must be documented for the model"
+        );
+    }
+
+    #[test]
+    fn report_layout_helpers_classify_rows_and_columns() {
+        assert_eq!(column_letters(0), "A");
+        assert_eq!(column_letters(25), "Z");
+        assert_eq!(column_letters(26), "AA");
+        assert_eq!(column_letters(27), "AB");
+
+        assert!(report_is_total_label("TOTAL ASSETS"));
+        assert!(report_is_total_label("Subtotal"));
+        assert!(report_is_total_label("Net income"));
+        assert!(report_is_total_label("Jumlah"));
+        assert!(!report_is_total_label("Revenue"));
+
+        assert!(report_is_section_row(&[json!("REVENUE"), Value::Null, json!("")]));
+        assert!(!report_is_section_row(&[json!("REVENUE"), json!(100)]));
+        assert!(!report_is_section_row(&[json!("TOTAL"), Value::Null, Value::Null]));
+
+        let rows = vec![
+            vec![json!("Product"), json!("Qty"), json!("Price")],
+            vec![json!("A"), json!(2), json!(10.0)],
+            vec![json!("B"), json!("=B2*C2"), Value::Null],
+        ];
+        assert_eq!(report_numeric_columns(&rows, 1), vec![1, 2]);
+
+        let widths = report_column_widths(3, 38, 16, &Map::new());
+        assert_eq!(widths[0].1, 38);
+        assert_eq!(widths[1].1, 16);
+        let mut overrides = Map::new();
+        overrides.insert("B".into(), json!(42));
+        assert_eq!(report_column_widths(3, 38, 16, &overrides)[1].1, 42);
     }
 }

@@ -4334,6 +4334,8 @@ fn humanize_tool_start(name: &str, args: &Value) -> String {
         }
         "undo" => "Undo…".into(),
         "redo" => "Redo…".into(),
+        "create_report" => "Building a clean report…".into(),
+        "layout_sheet" => "Applying a readable layout…".into(),
         "ui_control" => {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("ui");
             format!("Running UI action {method}…")
@@ -4428,6 +4430,8 @@ fn humanize_tool_done(name: &str, args: &Value, result: &Value) -> String {
         }
         "undo" => "Undone".into(),
         "redo" => "Redone".into(),
+        "create_report" => "Built a clean report".into(),
+        "layout_sheet" => "Layout applied".into(),
         "ui_control" => {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("ui");
             format!("UI action {method} finished")
@@ -5165,6 +5169,8 @@ fn execute_mcp_tool(
             let steps = a.get("steps").cloned().unwrap_or(json!(1));
             exec("edit.redo", json!({"steps": steps}))
         }
+        "create_report" => create_report_tool(control_tx, ctx, a),
+        "layout_sheet" => layout_sheet_tool(control_tx, ctx, a),
         "ui_control" => {
             if !turn_ctx.allow_ui_tools {
                 return Err(
@@ -5184,6 +5190,324 @@ fn execute_mcp_tool(
         other => Err(format!(
             "unknown tool `{other}`. GridCraft features are commands: find one with list_commands (e.g. {{\"search\":\"sort\"}}) and run it with execute_command."
         )),
+    }
+}
+
+/// Build a readable report from scratch: merged title, sized columns, number formats, section and
+/// total styling, optional chart, frozen header and print setup. Works through engine commands so
+/// it behaves exactly like a user using the ribbon.
+#[cfg(not(target_arch = "wasm32"))]
+fn create_report_tool(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::Context, a: &Map<String, Value>) -> Result<Value, String> {
+    let headers: Vec<String> = a
+        .get("headers")
+        .and_then(Value::as_array)
+        .ok_or("missing `headers`")?
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_string())
+        .collect();
+    if headers.is_empty() {
+        return Err("`headers` is empty".into());
+    }
+    let rows_in: Vec<Vec<Value>> =
+        a.get("rows").and_then(Value::as_array).ok_or("missing `rows`")?.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect();
+    if rows_in.is_empty() {
+        return Err("`rows` is empty".into());
+    }
+    let ncols = headers.len().max(rows_in.iter().map(Vec::len).max().unwrap_or(0)).max(2);
+    let title = a.get("title").and_then(Value::as_str).unwrap_or("");
+    let subtitle = a.get("subtitle").and_then(Value::as_str).unwrap_or("");
+    let number_format = a.get("number_format").and_then(Value::as_str).unwrap_or("#,##0.00");
+    let label_width = a.get("label_width").and_then(Value::as_u64).unwrap_or(38).clamp(12, 120) as u32;
+    let number_width = a.get("number_width").and_then(Value::as_u64).unwrap_or(16).clamp(8, 60) as u32;
+    let overrides = a.get("column_widths").and_then(Value::as_object).cloned().unwrap_or_default();
+    let freeze = a.get("freeze_header").and_then(Value::as_bool).unwrap_or(true);
+    let print = a.get("print_setup").and_then(Value::as_bool).unwrap_or(true);
+    let table_style = a.get("table_style").and_then(Value::as_bool).unwrap_or(false);
+
+    let mut errors: Vec<String> = Vec::new();
+    {
+        let mut run = |cmd: &str, params: Value| {
+            if let Err(e) = call_control(control_tx, ctx, "engine.execute", json!({"command": cmd, "params": params})) {
+                errors.push(format!("{cmd}: {e}"));
+            }
+        };
+
+        let last_col = crate::ai_tools::column_letters(ncols as u32 - 1);
+        let mut row = 1u32;
+        if !title.is_empty() {
+            run("range.setValues", json!({"range": "A1", "values": [[title]]}));
+            run("home.mergeCenter", json!({"range": format!("A1:{last_col}1")}));
+            run("home.bold", json!({"range": "A1", "on": true}));
+            run("home.fontSize", json!({"range": "A1", "size": 15}));
+            run("home.fillColor", json!({"range": "A1", "color": "#1F9D55"}));
+            run("home.fontColor", json!({"range": "A1", "color": "#FFFFFF"}));
+            run("home.rowHeight", json!({"rows": "1:1", "points": 26}));
+            row += 1;
+        }
+        if !subtitle.is_empty() {
+            let range = format!("A{row}:{last_col}{row}");
+            run("range.setValues", json!({"range": format!("A{row}"), "values": [[subtitle]]}));
+            run("home.mergeCenter", json!({"range": range}));
+            run("home.italic", json!({"range": format!("A{row}"), "on": true}));
+            run("home.fontColor", json!({"range": format!("A{row}"), "color": "#666666"}));
+            row += 1;
+        }
+        let header_row = row;
+        let data_start = header_row + 1;
+        let last_row = data_start + rows_in.len() as u32 - 1;
+
+        let padded_header: Vec<Value> = (0..ncols).map(|col| headers.get(col).map(|h| Value::String(h.clone())).unwrap_or(Value::Null)).collect();
+        run("range.setValues", json!({"range": format!("A{header_row}"), "values": [padded_header]}));
+        let padded_rows: Vec<Vec<Value>> =
+            rows_in.iter().map(|data| (0..ncols).map(|col| data.get(col).cloned().unwrap_or(Value::Null)).collect()).collect();
+        run("range.setValues", json!({"range": format!("A{data_start}"), "values": padded_rows}));
+
+        let header_range = format!("A{header_row}:{last_col}{header_row}");
+        run("home.bold", json!({"range": header_range, "on": true}));
+        run("home.fillColor", json!({"range": header_range, "color": "#D9EAD3"}));
+        run("home.alignCenter", json!({"range": header_range}));
+        run("home.wrapText", json!({"range": header_range, "on": true}));
+        run("home.borders", json!({"range": header_range, "preset": "bottom", "style": "medium"}));
+
+        let detected_numeric = crate::ai_tools::report_numeric_columns(&padded_rows, 1);
+        let numeric_columns = if detected_numeric.is_empty() { vec![1.min(ncols - 1)] } else { detected_numeric };
+        for col in &numeric_columns {
+            let letters = crate::ai_tools::column_letters(*col as u32);
+            let range = format!("{letters}{data_start}:{letters}{last_row}");
+            run("home.numberFormat", json!({"range": range, "format": number_format}));
+            run("home.alignRight", json!({"range": range}));
+        }
+        run("home.wrapText", json!({"range": format!("A{data_start}:A{last_row}"), "on": true}));
+        run("home.alignLeft", json!({"range": format!("A{data_start}:A{last_row}")}));
+        for (letters, chars) in crate::ai_tools::report_column_widths(ncols, label_width, number_width, &overrides) {
+            run("home.columnWidth", json!({"cols": letters, "chars": chars}));
+        }
+
+        let explicit_sections: Option<Vec<usize>> = a
+            .get("section_rows")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(|value| value.as_u64().map(|index| index as usize)).collect());
+        let sections = explicit_sections.unwrap_or_else(|| {
+            padded_rows.iter().enumerate().filter(|(_, data)| crate::ai_tools::report_is_section_row(data)).map(|(index, _)| index).collect()
+        });
+        for index in &sections {
+            let sheet_row = data_start + *index as u32;
+            let range = format!("A{sheet_row}:{last_col}{sheet_row}");
+            run("home.bold", json!({"range": format!("A{sheet_row}"), "on": true}));
+            run("home.fillColor", json!({"range": range, "color": "#F2F2F2"}));
+        }
+        let explicit_totals: Option<Vec<usize>> = a
+            .get("total_rows")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(|value| value.as_u64().map(|index| index as usize)).collect());
+        let totals = explicit_totals.unwrap_or_else(|| {
+            padded_rows
+                .iter()
+                .enumerate()
+                .filter(|(_, data)| data.first().and_then(Value::as_str).is_some_and(crate::ai_tools::report_is_total_label))
+                .map(|(index, _)| index)
+                .collect()
+        });
+        for index in &totals {
+            let sheet_row = data_start + *index as u32;
+            let range = format!("A{sheet_row}:{last_col}{sheet_row}");
+            run("home.bold", json!({"range": range, "on": true}));
+            run("home.fillColor", json!({"range": range, "color": "#F3F3F3"}));
+            run("home.borders", json!({"range": format!("A{sheet_row}:{last_col}{sheet_row}"), "preset": "top", "style": "thin"}));
+            run("home.borders", json!({"range": format!("A{sheet_row}:{last_col}{sheet_row}"), "preset": "doubleBottom", "style": "double"}));
+        }
+        let table_range = format!("A{header_row}:{last_col}{last_row}");
+        run("home.borders", json!({"range": table_range, "preset": "outside"}));
+        if table_style {
+            run("insert.table", json!({"range": table_range, "style": "TableStyleMedium2"}));
+        }
+
+        if freeze {
+            run("view.freezePanes", json!({"cell": format!("A{}", header_row + 1)}));
+        }
+        if print {
+            run("pageLayout.printArea", json!({"range": format!("A1:{last_col}{last_row}")}));
+            run(
+                "pageLayout.pageSetup",
+                json!({
+                    "orientation": if ncols > 6 { "landscape" } else { "portrait" },
+                    "fitToPage": true,
+                    "fitWidth": 1,
+                    "fitHeight": 0,
+                    "centerH": true
+                }),
+            );
+        }
+
+        let mut chart_value = Value::Null;
+        if let Some(chart) = a.get("chart").and_then(Value::as_object) {
+            let chart_type = chart.get("type").and_then(Value::as_str).unwrap_or("column");
+            let chart_title = chart.get("title").and_then(Value::as_str).unwrap_or(if title.is_empty() { "Chart" } else { title });
+            let anchor = chart
+                .get("at")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}{}", crate::ai_tools::column_letters(ncols as u32 + 1), header_row));
+            let mut ranges = vec![format!("A{data_start}:A{last_row}")];
+            for col in numeric_columns.iter().take(3) {
+                let letters = crate::ai_tools::column_letters(*col as u32);
+                ranges.push(format!("{letters}{data_start}:{letters}{last_row}"));
+            }
+            chart_value = json!({"range": ranges.join(","), "type": chart_type, "title": chart_title, "at": anchor});
+            run(
+                "insert.chart",
+                json!({"range": ranges.join(","), "type": chart_type, "title": chart_title, "at": anchor, "width": 520, "height": 320}),
+            );
+        }
+
+        Ok(json!({
+            "ok": errors.is_empty(),
+            "headerRow": header_row,
+            "dataStartRow": data_start,
+            "lastRow": last_row,
+            "columns": ncols,
+            "numericColumns": numeric_columns.iter().map(|col| crate::ai_tools::column_letters(*col as u32)).collect::<Vec<_>>(),
+            "sectionRows": sections.iter().map(|index| data_start + *index as u32).collect::<Vec<_>>(),
+            "totalRows": totals.iter().map(|index| data_start + *index as u32).collect::<Vec<_>>(),
+            "chart": chart_value,
+            "errors": errors
+        }))
+    }
+}
+
+/// Lay out an existing (possibly cramped) range without rewriting its values: readable column
+/// widths, number formats, alignment, header/total styling, borders, frozen header and print setup.
+#[cfg(not(target_arch = "wasm32"))]
+fn layout_sheet_tool(control_tx: &Option<Sender<ControlRequest>>, ctx: &egui::Context, a: &Map<String, Value>) -> Result<Value, String> {
+    let read_params = match a.get("range") {
+        Some(range) => json!({"range": range}),
+        None => json!({}),
+    };
+    let read = call_control(control_tx, ctx, "sheet.read", read_params)?;
+    let values: Vec<Vec<Value>> = read
+        .get("values")
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect())
+        .unwrap_or_default();
+    if values.is_empty() {
+        return Err("the range is empty; write data first".into());
+    }
+    let range_text = read.get("range").and_then(Value::as_str).unwrap_or("A1").to_string();
+    let parsed = RangeRef::parse(split_sheet(&range_text).1).ok_or_else(|| format!("cannot parse range `{range_text}`"))?;
+    let start_col = parsed.start.col;
+    let start_row = parsed.start.row + 1;
+    let end_row = parsed.end.row + 1;
+    let ncols = values.iter().map(Vec::len).max().unwrap_or(0).max((parsed.end.col - parsed.start.col + 1) as usize).max(1);
+    let number_format = a.get("number_format").and_then(Value::as_str).unwrap_or("#,##0.00");
+    let label_col = a.get("label_column").and_then(Value::as_str).and_then(|text| text.trim().chars().next()).unwrap_or('A');
+    let header_row = a.get("header_row").and_then(Value::as_u64).map(|value| value as u32).unwrap_or(start_row);
+
+    let mut errors: Vec<String> = Vec::new();
+    {
+        let mut run = |cmd: &str, params: Value| {
+            if let Err(e) = call_control(control_tx, ctx, "engine.execute", json!({"command": cmd, "params": params})) {
+                errors.push(format!("{cmd}: {e}"));
+            }
+        };
+
+        if let Some(title_range) = a.get("title_range").and_then(Value::as_str) {
+            run("home.mergeCenter", json!({"range": title_range}));
+            run("home.bold", json!({"range": title_range, "on": true}));
+            run("home.fontSize", json!({"range": title_range, "size": 15}));
+        }
+
+        let data_start = header_row + 1;
+        let last_col_letters = crate::ai_tools::column_letters(start_col + ncols as u32 - 1);
+        if data_start <= end_row {
+            let header_range = format!("{label_col}{header_row}:{last_col_letters}{header_row}");
+            run("home.bold", json!({"range": header_range, "on": true}));
+            run("home.fillColor", json!({"range": header_range, "color": "#D9EAD3"}));
+            run("home.wrapText", json!({"range": header_range, "on": true}));
+            run("home.alignCenter", json!({"range": header_range}));
+        }
+
+        let explicit_number_cols: Option<Vec<u32>> = a.get("number_columns").and_then(Value::as_array).map(|cols| {
+            cols.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|text| text.trim().chars().next())
+                .map(|ch| (ch.to_ascii_uppercase() as u32).saturating_sub('A' as u32))
+                .collect()
+        });
+        let numeric_columns: Vec<u32> = explicit_number_cols.unwrap_or_else(|| {
+            let skip_rows = ((header_row.saturating_sub(start_row)) + 1) as usize;
+            let rows: Vec<Vec<Value>> = values.iter().skip(skip_rows).cloned().collect();
+            crate::ai_tools::report_numeric_columns(&rows, 1).into_iter().map(|col| start_col + col as u32).collect()
+        });
+        for col in &numeric_columns {
+            let letters = crate::ai_tools::column_letters(*col);
+            let range = format!("{letters}{data_start}:{letters}{end_row}");
+            run("home.numberFormat", json!({"range": range, "format": number_format}));
+            run("home.alignRight", json!({"range": range}));
+        }
+        run("home.wrapText", json!({"range": format!("{label_col}{data_start}:{label_col}{end_row}"), "on": true}));
+
+        let autofit = a.get("autofit_widths").and_then(Value::as_bool).unwrap_or(true);
+        for col in start_col..start_col + ncols as u32 {
+            let letters = crate::ai_tools::column_letters(col);
+            let chars = if autofit {
+                values
+                    .iter()
+                    .filter_map(|row| row.get((col - start_col) as usize))
+                    .map(|cell| match cell {
+                        Value::String(text) => text.chars().count() as u32,
+                        Value::Null => 6,
+                        _ => 16,
+                    })
+                    .max()
+                    .unwrap_or(12)
+                    .clamp(10, 60)
+            } else if col == start_col + (label_col as u32).saturating_sub('A' as u32) {
+                38
+            } else {
+                16
+            };
+            run("home.columnWidth", json!({"cols": letters, "chars": chars}));
+        }
+
+        let explicit_totals: Option<Vec<u32>> =
+            a.get("total_rows").and_then(Value::as_array).map(|rows| rows.iter().filter_map(Value::as_u64).map(|row| row as u32).collect());
+        let totals: Vec<u32> = explicit_totals.unwrap_or_else(|| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (start_row + index as u32, row))
+                .filter(|(sheet_row, _)| *sheet_row > header_row)
+                .filter(|(_, row)| row.first().and_then(Value::as_str).is_some_and(crate::ai_tools::report_is_total_label))
+                .map(|(sheet_row, _)| sheet_row)
+                .collect()
+        });
+        for sheet_row in &totals {
+            let range = format!("{label_col}{sheet_row}:{last_col_letters}{sheet_row}");
+            run("home.bold", json!({"range": range, "on": true}));
+            run("home.borders", json!({"range": range, "preset": "top", "style": "thin"}));
+            run("home.borders", json!({"range": range, "preset": "doubleBottom", "style": "double"}));
+        }
+        let table_range = format!("A{header_row}:{last_col_letters}{end_row}");
+        run("home.borders", json!({"range": table_range, "preset": "outside"}));
+        if a.get("freeze_header").and_then(Value::as_bool).unwrap_or(true) {
+            run("view.freezePanes", json!({"cell": format!("{label_col}{}", header_row + 1)}));
+        }
+        if a.get("print_setup").and_then(Value::as_bool).unwrap_or(true) {
+            run("pageLayout.printArea", json!({"range": format!("A{start_row}:{last_col_letters}{end_row}")}));
+            run(
+                "pageLayout.pageSetup",
+                json!({"orientation": if ncols > 6 { "landscape" } else { "portrait" }, "fitToPage": true, "fitWidth": 1, "fitHeight": 0, "centerH": true}),
+            );
+        }
+
+        Ok(json!({
+            "ok": errors.is_empty(),
+            "range": range_text,
+            "headerRow": header_row,
+            "numericColumns": numeric_columns.iter().map(|col| crate::ai_tools::column_letters(*col)).collect::<Vec<_>>(),
+            "totalRows": totals,
+            "errors": errors
+        }))
     }
 }
 

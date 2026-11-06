@@ -49,12 +49,36 @@ The engine and the agent both support starting from scratch. A validated recipe 
    ["Product","Category","Qty","Price","Total"], ["Gaming Laptop","Electronics",12,18500000,"=C3*D3"], …,
    ["TOTAL","","","","=SUM(E3:E12)"]]`.
 2. `home.bold`/`home.fillColor`/`home.fontColor` on the title and header, `home.numberFormat`
-   (`#,##0.00`) on the money columns, `home.borders` on the block, `insert.table` for a table style.
+   (`#,##0.00`) on the money columns, `home.borders` on the block, `home.autofitColumnWidth` for
+   readable columns, `insert.table` for a table style.
 3. `insert.chart` (`{"range":"B3:E12","type":"column","title":"Sales by Product","at":"G2"}`) when a
    chart is wanted, then `file.saveAs` / `file.exportPdf`.
 
 The same sequence is reproducible without the AI: `gridcraft-cli run --script` with `range.setValues`,
 `home.*`, `insert.table` and `insert.chart` builds the identical report.
+
+## Report layout tools
+
+Hand-placing cells one by one is where models produce cramped columns, `###` and clipped labels, so
+the agent has two layout-first tools:
+
+- **`create_report`** builds a clean table/report in one call: merged title (and optional subtitle),
+  a bold header row, readable column widths (label column ~38 characters, numeric columns ~16, or
+  explicit `column_widths`), number formats on the numeric columns, right-aligned numbers, wrapped
+  labels, section rows in bold with a tint, bold totals with a top + double bottom border, an
+  optional chart, a frozen header and a print area with fit-to-page. Rows are arrays with the label
+  in the first column; section/total rows are auto-detected (`TOTAL`, `Subtotal`, `Gross`, `Net`,
+  `Jumlah`, `Laba`, `Rugi`, …) or passed explicitly as `section_rows`/`total_rows`.
+- **`layout_sheet`** repairs an existing range without rewriting its values: AutoFit widths (or fixed
+  label/number widths), a bold header row, number formats on detected numeric columns, bold bordered
+  totals, a frozen header and print setup. It accepts explicit `header_row`, `label_column`,
+  `number_columns`, `total_rows` and `title_range`, and reads the sheet when they are omitted.
+
+A prompt like "buatkan laporan penjualan 10 produk" should call `create_report` with the headers and
+rows (or generate the data first) instead of writing cells individually; an income statement with
+section headings is just rows where only the first cell has text. If a sheet already looks cramped,
+`layout_sheet` fixes widths, formats and borders in place.
+
 
 ## Choosing a model (LLM API tab)
 
