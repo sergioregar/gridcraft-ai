@@ -2258,7 +2258,7 @@ fn verify_cli_model_usable(cli: CliAgent, cmd_name: &str, model_id: &str, cancel
                 "--disable-slash-commands".to_string(),
                 "--dangerously-skip-permissions".to_string(),
                 "--print-timeout".to_string(),
-                "15s".to_string(),
+                "45s".to_string(),
             ];
             if !model_id.is_empty() && model_id != "default" {
                 a.push("--model".to_string());
@@ -2300,7 +2300,7 @@ fn verify_cli_model_usable(cli: CliAgent, cmd_name: &str, model_id: &str, cancel
     };
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run_process_cancellable_with_stdin(cmd_name, &arg_refs, stdin_bytes, work_dir.as_deref(), cancel, false, 22)?;
+    let out = run_process_cancellable_with_stdin(cmd_name, &arg_refs, stdin_bytes, work_dir.as_deref(), cancel, false, 60)?;
 
     if let Some(err_msg) = detect_cli_output_error(&out) {
         return Err(err_msg);
