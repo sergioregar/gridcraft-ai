@@ -18,6 +18,8 @@
 //!
 //! [`Session::windows`]: gridcraft_engine::Session::windows
 
+use std::collections::{HashMap, HashSet};
+
 use craft_window::{CASCADE_STEP, Frame, Rect, Viewports, WindowEvent, WindowId, WindowList, cascade};
 use serde_json::json;
 
@@ -34,6 +36,10 @@ pub struct DocWindows {
     quit_with_last_window: bool,
     /// The root viewport is hidden because no window is open.
     root_hidden: bool,
+    /// Windows already known to be on the root window's monitor. A window is checked once: when it
+    /// first appears completely outside the root window it is moved back onto it, so a new File ›
+    /// New/Open window can never be created off-screen.
+    seen_on_screen: HashSet<WindowId>,
 }
 
 impl DocWindows {
@@ -41,7 +47,14 @@ impl DocWindows {
     pub fn new(app: &mut SheetApp, base: egui::ViewportBuilder, quit_with_last_window: bool) -> DocWindows {
         app.native_windows = true;
         // The root window keeps the desktop's frame, so every window does.
-        DocWindows { list: WindowList::new(), viewports: Viewports::new(Frame::Desktop), base, quit_with_last_window, root_hidden: false }
+        DocWindows {
+            list: WindowList::new(),
+            viewports: Viewports::new(Frame::Desktop),
+            base,
+            quit_with_last_window,
+            root_hidden: false,
+            seen_on_screen: HashSet::new(),
+        }
     }
 
     /// The platform default for the last window closing: macOS keeps running, others quit.
@@ -75,9 +88,45 @@ impl DocWindows {
         self.list.active().map(|w| self.viewports.viewport_id(w)).unwrap_or(egui::ViewportId::ROOT)
     }
 
+    /// Keep new windows cascading inside the root window's monitor instead of trusting a guessed
+    /// monitor tile. The root window's own outer rectangle is the one work area egui actually
+    /// reports, so new File › New/Open windows can never start off-screen.
+    fn refresh_cascade_bounds(&mut self, ctx: &egui::Context) {
+        let rect = ctx.input(|i| i.viewport().outer_rect);
+        let bounds = rect.filter(|r| r.width() > 100.0 && r.height() > 100.0).map(|r| Rect::new(r.min.x, r.min.y, r.width(), r.height()));
+        self.viewports.set_bounds(bounds);
+    }
+
+    /// A window created while the previous window sat at a stale off-screen position can still land
+    /// outside the root window. Check every window the first time it appears and, when it does not
+    /// overlap the root window at all, move it back onto the root window's monitor. The window is
+    /// only checked once, so a window the user later moves to another monitor stays there.
+    fn keep_windows_visible(&mut self, ctx: &egui::Context, rects: &HashMap<WindowId, Option<egui::Rect>>) {
+        let Some(root_rect) = ctx.input(|i| i.viewport().outer_rect) else { return };
+        let mut step = 0.0_f32;
+        for (id, rect) in rects {
+            if self.viewports.root() == Some(*id) || self.seen_on_screen.contains(id) {
+                continue;
+            }
+            let Some(rect) = rect else { continue };
+            let overlaps =
+                rect.max.x >= root_rect.min.x && rect.min.x <= root_rect.max.x && rect.max.y >= root_rect.min.y && rect.min.y <= root_rect.max.y;
+            if overlaps {
+                self.seen_on_screen.insert(*id);
+                continue;
+            }
+            let viewport = self.viewports.viewport_id(*id);
+            let pos = egui::pos2(root_rect.min.x + CASCADE_STEP * step, root_rect.min.y + CASCADE_STEP * step);
+            step += 1.0;
+            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::OuterPosition(pos));
+        }
+        self.seen_on_screen.retain(|id| self.list.contains(*id));
+    }
+
     /// Call each frame after [`SheetApp::logic`], also while the root is hidden (eframe runs only
     /// the logic then): shows windows created or opened by menu commands, files and scripts.
     pub fn logic(&mut self, app: &mut SheetApp, ctx: &egui::Context) {
+        self.refresh_cascade_bounds(ctx);
         self.sync(app, ctx);
         if let Some((arrange, windows)) = app.arrange_windows.take() {
             self.arrange(ctx, &arrange, &windows);
@@ -166,18 +215,22 @@ impl DocWindows {
     /// [`SheetApp::ui`].
     pub fn show(&mut self, app: &mut SheetApp, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.refresh_cascade_bounds(&ctx);
         self.sync(app, &ctx);
         let focused = self.list.active().and_then(|id| self.list.get(id).copied());
         let titles: std::collections::HashMap<u64, String> = self.list.iter().map(|(_, w)| (*w, window_title(app, *w))).collect();
         let base = &self.base;
+        // The root window's rectangle, and where every other window actually landed this frame.
+        let mut child_rects: HashMap<WindowId, Option<egui::Rect>> = HashMap::new();
         // The window a command run in some window's UI activated (File › New, Switch Windows, a close).
         let mut requested: Option<u64> = None;
         let events = self.viewports.show(
             ui,
             &mut self.list,
             |_, w| base.clone().with_title(titles.get(w).cloned().unwrap_or_default()),
-            |ui, _, w| {
+            |ui, id, w| {
                 app.show_window(*w);
+                child_rects.insert(id, ui.ctx().input(|i| i.viewport().outer_rect));
                 // Files dropped on a window open as workbooks (the root's arrive through the app's
                 // raw input hook; a child window's input reaches only its own pass).
                 let dropped: Vec<String> = ui
@@ -214,6 +267,7 @@ impl DocWindows {
             }
             app.enter_window(target);
         }
+        self.keep_windows_visible(&ctx, &child_rects);
         self.sync(app, &ctx);
     }
 

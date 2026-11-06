@@ -32,13 +32,15 @@ pub struct WindowUi {
 
 impl WindowUi {
     /// A new window's state. The last border, fill and font colour picked carry over, as they are
-    /// the user's recent choices rather than the window's.
+    /// the user's recent choices rather than the window's; an open task pane (the AI Agent, comments,
+    /// watch…) carries over too, so opening another file keeps the AI Agent at hand.
     fn fresh(like: &grid::GridState) -> WindowUi {
         WindowUi {
             grid: grid::GridState {
                 last_border: like.last_border.clone(),
                 last_fill: like.last_fill.clone(),
                 last_font_color: like.last_font_color.clone(),
+                pane: like.pane.clone(),
                 ..Default::default()
             },
             ..Default::default()
@@ -142,5 +144,18 @@ impl SheetApp {
     /// Whether a window other than the current one has a cell or text-box draft open.
     pub fn parked_window_with_draft(&self) -> Option<u64> {
         self.parked.iter().filter(|(_, w)| w.editor.is_some() || w.text_box_editor.is_some()).map(|(id, _)| *id).min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_window_keeps_an_open_task_pane() {
+        // Opening another file must not lose the AI Agent (or comments/watch) pane.
+        let like = grid::GridState { pane: Some("aiAgent".into()), ..Default::default() };
+        assert_eq!(WindowUi::fresh(&like).grid.pane.as_deref(), Some("aiAgent"));
+        assert!(WindowUi::fresh(&grid::GridState::default()).grid.pane.is_none());
     }
 }
